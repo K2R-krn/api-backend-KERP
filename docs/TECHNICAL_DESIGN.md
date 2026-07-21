@@ -134,8 +134,10 @@ Every table carries these, applied uniformly:
 | `created_at` | `timestamptz` not null default `now()` | Creation time. |
 | `updated_at` | `timestamptz` not null default `now()` | Updated by app/trigger on change. |
 | `deleted_at` | `timestamptz` nullable | **Soft delete.** Non-null = deleted. Never hard-delete business data. |
-| `created_by` | `uuid` nullable → `users.id` | Who created it (audit). |
-| `updated_by` | `uuid` nullable → `users.id` | Who last changed it. |
+| `created_by` | `uuid` nullable | Who created it (audit). References `users.id` by convention — **no DB-level FK constraint** (see note). |
+| `updated_by` | `uuid` nullable | Who last changed it. Same convention, no FK constraint. |
+
+- **`created_by` / `updated_by` are plain `uuid` columns, not foreign keys.** They hold a `users.id` value by convention but carry no FK constraint: declaring real FKs would add a back-relation on `users` for every table in the schema for no query benefit, and these are audit breadcrumbs on rows whose referenced user is never hard-deleted. Referential integrity here is a convention enforced by the service layer, not the database.
 
 - **Soft delete rule:** all reads filter `deleted_at IS NULL` by default. Deleting sets the timestamp.
 - For tables below, these common columns are implied and not repeated; only domain columns are listed.
