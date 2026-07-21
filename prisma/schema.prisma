@@ -7,3 +7,338 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
 }
+
+// ============================================================================
+// Phase 0 — Foundation (TDD §5)
+// ============================================================================
+
+model User {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  username           String
+  passwordHash       String    @map("password_hash")
+  name               String
+  role               String
+  email              String?
+  isActive           Boolean   @default(true) @map("is_active")
+  mustChangePassword Boolean   @default(true) @map("must_change_password")
+  lastLoginAt        DateTime? @map("last_login_at") @db.Timestamptz()
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  userBranches    UserBranch[]
+  auditLogs       AuditLog[]
+  refreshTokens   RefreshToken[]
+  idempotencyKeys IdempotencyKey[]
+
+  @@index([username])
+  @@index([email])
+  @@map("users")
+}
+
+model Branch {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  code      String
+  gstin     String?
+  stateCode String  @map("state_code")
+  address   String?
+  phone     String?
+  isActive  Boolean @default(true) @map("is_active")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  userBranches UserBranch[]
+  auditLogs    AuditLog[]
+  numberSeries NumberSeries[]
+  ledgers      Ledger[]
+  branchStock  BranchStock[]
+  parties      Party[]
+
+  @@index([code])
+  @@map("branches")
+}
+
+model UserBranch {
+  userId   String @map("user_id") @db.Uuid
+  branchId String @map("branch_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user   User   @relation(fields: [userId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@id([userId, branchId])
+  @@index([branchId])
+  @@map("user_branches")
+}
+
+model AuditLog {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String?  @map("user_id") @db.Uuid
+  branchId   String?  @map("branch_id") @db.Uuid
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String?  @map("entity_id") @db.Uuid
+  before     Json?
+  after      Json?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  user   User?   @relation(fields: [userId], references: [id])
+  branch Branch? @relation(fields: [branchId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([branchId, createdAt])
+  @@map("audit_logs")
+}
+
+model NumberSeries {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  branchId      String  @map("branch_id") @db.Uuid
+  voucherType   String  @map("voucher_type")
+  financialYear String  @map("financial_year")
+  prefix        String?
+  currentNumber Int     @default(0) @map("current_number")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([branchId, voucherType, financialYear])
+  @@map("number_series")
+}
+
+model CompanyProfile {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessName  String  @map("business_name")
+  legalName     String? @map("legal_name")
+  logoUrl       String? @map("logo_url")
+  invoiceTerms  String? @map("invoice_terms")
+  invoiceFooter String? @map("invoice_footer")
+  roundingMode  String  @default("none") @map("rounding_mode")
+  fyStartMonth  Int     @default(4) @map("fy_start_month")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  @@map("company_profile")
+}
+
+// ============================================================================
+// Phase 1 — Masters (TDD §6)
+// ============================================================================
+
+model AccountGroup {
+  id              String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String
+  tallyEquivalent String? @map("tally_equivalent")
+  nature          String
+  parentGroupId   String? @map("parent_group_id") @db.Uuid
+  isSystem        Boolean @default(false) @map("is_system")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  parentGroup AccountGroup?  @relation("AccountGroupHierarchy", fields: [parentGroupId], references: [id])
+  childGroups AccountGroup[] @relation("AccountGroupHierarchy")
+  ledgers     Ledger[]
+
+  @@index([parentGroupId])
+  @@map("account_groups")
+}
+
+model Ledger {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name           String
+  accountGroupId String  @map("account_group_id") @db.Uuid
+  branchId       String? @map("branch_id") @db.Uuid
+  openingBalance BigInt  @default(0) @map("opening_balance")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  accountGroup AccountGroup @relation(fields: [accountGroupId], references: [id])
+  branch       Branch?      @relation(fields: [branchId], references: [id])
+  parties      Party[]
+
+  @@index([accountGroupId])
+  @@index([branchId])
+  @@map("ledgers")
+}
+
+model Unit {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name             String
+  symbol           String
+  baseUnitId       String?  @map("base_unit_id") @db.Uuid
+  conversionFactor Decimal? @map("conversion_factor") @db.Decimal(12, 4)
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  baseUnit Unit?     @relation("UnitConversion", fields: [baseUnitId], references: [id])
+  variants Unit[]    @relation("UnitConversion")
+  products Product[]
+
+  @@index([baseUnitId])
+  @@map("units")
+}
+
+model Category {
+  id                       String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name                     String
+  parentId                 String?  @map("parent_id") @db.Uuid
+  defaultGstRate           Decimal? @map("default_gst_rate") @db.Decimal(5, 2)
+  defaultTaxClassification String?  @map("default_tax_classification")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  parent   Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryHierarchy")
+  products Product[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id                String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name              String
+  hsnCode           String? @map("hsn_code")
+  sku               String?
+  categoryId        String? @map("category_id") @db.Uuid
+  unitId            String  @map("unit_id") @db.Uuid
+  gstRate           Decimal @default(0) @map("gst_rate") @db.Decimal(5, 2)
+  priceIncludesGst  Boolean @default(false) @map("price_includes_gst")
+  taxClassification String  @default("taxable") @map("tax_classification")
+  purchasePrice     BigInt  @default(0) @map("purchase_price")
+  salePrice         BigInt  @default(0) @map("sale_price")
+  mrp               BigInt?
+  isActive          Boolean @default(true) @map("is_active")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  category    Category?     @relation(fields: [categoryId], references: [id])
+  unit        Unit          @relation(fields: [unitId], references: [id])
+  branchStock BranchStock[]
+
+  @@index([categoryId])
+  @@index([unitId])
+  @@index([name])
+  @@index([hsnCode])
+  @@map("products")
+}
+
+model BranchStock {
+  branchId          String   @map("branch_id") @db.Uuid
+  productId         String   @map("product_id") @db.Uuid
+  quantity          Decimal  @default(0) @db.Decimal(12, 3)
+  avgCost           BigInt   @default(0) @map("avg_cost")
+  lowStockThreshold Decimal? @map("low_stock_threshold") @db.Decimal(12, 3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+
+  branch  Branch  @relation(fields: [branchId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@id([branchId, productId])
+  @@index([productId])
+  @@map("branch_stock")
+}
+
+model Party {
+  id             String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  type           String
+  name           String
+  village        String
+  mobile         String?
+  email          String?
+  gstin          String?
+  stateCode      String  @map("state_code")
+  address        String?
+  ledgerId       String  @map("ledger_id") @db.Uuid
+  owningBranchId String  @map("owning_branch_id") @db.Uuid
+  isActive       Boolean @default(true) @map("is_active")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  ledger       Ledger @relation(fields: [ledgerId], references: [id])
+  owningBranch Branch @relation(fields: [owningBranchId], references: [id])
+
+  @@index([ledgerId])
+  @@index([owningBranchId])
+  @@index([name, village])
+  @@map("parties")
+}
+
+// ============================================================================
+// Iteration 2 additions (TDD §11.3, §14.1)
+// ============================================================================
+
+model RefreshToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz()
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz()
+  userAgent String?   @map("user_agent")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("refresh_tokens")
+}
+
+model IdempotencyKey {
+  key         String   @id
+  userId      String   @map("user_id") @db.Uuid
+  scope       String
+  requestHash String   @map("request_hash")
+  status      String
+  response    Json?
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  expiresAt   DateTime @map("expires_at") @db.Timestamptz()
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("idempotency_keys")
+}
