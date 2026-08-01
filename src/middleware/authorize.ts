@@ -9,11 +9,16 @@ import type { Role } from "../shared/types.js";
  */
 export type Capability =
   | "branch:manage" // Blueprint doesn't list branch CRUD explicitly; treated like user:manage (root-of-multi-branch, super_admin only).
+  | "branch:read" // Every role needs to know its own branch(es) while working — same reasoning as product:read.
   | "user:manage"
   | "product:write"
   | "product:read"
   | "party:write"
   | "party:read"
+  | "category:write"
+  | "category:read"
+  | "unit:write"
+  | "unit:read"
   | "sale:create"
   | "sale:editCancel"
   // OPEN ITEM: Blueprint §4 says Employee gets "partial" purchase rights; TDD §7.2's Employee
@@ -32,6 +37,7 @@ export type Capability =
 
 const CAN: Record<Capability, Role[]> = {
   "branch:manage": ["super_admin"],
+  "branch:read": ["super_admin", "admin", "employee", "accountant"],
   "user:manage": ["super_admin"],
   "product:write": ["super_admin", "admin"],
   // Every role needs to look products up while working (billing, payments, reports) — same
@@ -40,6 +46,10 @@ const CAN: Record<Capability, Role[]> = {
   "party:write": ["super_admin", "admin"],
   // Every role needs to look customers/suppliers up while working (billing, payments, reports).
   "party:read": ["super_admin", "admin", "employee", "accountant"],
+  "category:write": ["super_admin", "admin"],
+  "category:read": ["super_admin", "admin", "employee", "accountant"],
+  "unit:write": ["super_admin", "admin"],
+  "unit:read": ["super_admin", "admin", "employee", "accountant"],
   "sale:create": ["super_admin", "admin", "employee"],
   "sale:editCancel": ["super_admin", "admin"],
   "purchase:create": ["super_admin", "admin"],

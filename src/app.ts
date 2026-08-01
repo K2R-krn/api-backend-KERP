@@ -4,8 +4,11 @@ import { authenticate } from "./middleware/authenticate.js";
 import { requireCap } from "./middleware/authorize.js";
 import { branchContext } from "./middleware/branch-context.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
+import { branchRouter } from "./modules/branches/branch.routes.js";
+import { categoryRouter } from "./modules/categories/category.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
 import { productRouter } from "./modules/products/product.routes.js";
+import { unitRouter } from "./modules/units/unit.routes.js";
 import { success } from "./shared/envelope.js";
 import { errorHandler } from "./shared/error-handler.js";
 
@@ -39,5 +42,13 @@ app.use("/api/v1/parties", partyRouter);
 // shared catalog (no branch_id column, TDD §6.5); branchContext still runs per route purely to
 // resolve the acting branch for the audit row, not to scope reads/writes.
 app.use("/api/v1/products", productRouter);
+
+// Roadmap §4 step 8 continued — Branches, Categories, Units. Branches is the root of
+// multi-branch config (TDD §5.2) and deliberately skips branchContext (see branch.service.ts).
+// Categories/Units are shared catalogs like Products (TDD §6.3/§6.4) and follow the same
+// branchContext-for-audit-tagging-only pattern.
+app.use("/api/v1/branches", branchRouter);
+app.use("/api/v1/categories", categoryRouter);
+app.use("/api/v1/units", unitRouter);
 
 app.use(errorHandler);

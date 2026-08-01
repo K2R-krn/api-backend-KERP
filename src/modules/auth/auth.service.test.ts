@@ -67,27 +67,34 @@ describe("auth.service", () => {
     ).rejects.toMatchObject({ code: "INVALID_CREDENTIALS" });
   });
 
-  it("gives a limited token when must_change_password is set; change-password clears it", async () => {
-    const user = await createTestUser({ mustChangePassword: true });
-    userId = user.id;
+  // Heaviest test in this file: 2 argon2id hashes + 2 verifies + several DB round-trips, all
+  // against the real remote dev DB. The global 15s testTimeout has been observed to fail this
+  // one specifically under full-suite load (network/DB jitter, not a bug) — give it real headroom.
+  it(
+    "gives a limited token when must_change_password is set; change-password clears it",
+    async () => {
+      const user = await createTestUser({ mustChangePassword: true });
+      userId = user.id;
 
-    const first = await authService.login({ username: user.username, password: TEST_PASSWORD }, {});
-    if (!first.mustChangePassword) throw new Error("expected the must-change-password path");
+      const first = await authService.login({ username: user.username, password: TEST_PASSWORD }, {});
+      if (!first.mustChangePassword) throw new Error("expected the must-change-password path");
 
-    const { userId: decodedUserId } = verifyMustChangePasswordToken(first.changePasswordToken);
-    expect(decodedUserId).toBe(user.id);
+      const { userId: decodedUserId } = verifyMustChangePasswordToken(first.changePasswordToken);
+      expect(decodedUserId).toBe(user.id);
 
-    await authService.changePassword({ newPassword: "brand-new-password-123" }, { userId: decodedUserId });
+      await authService.changePassword({ newPassword: "brand-new-password-123" }, { userId: decodedUserId });
 
-    const updatedUser = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
-    expect(updatedUser.mustChangePassword).toBe(false);
+      const updatedUser = await prisma.user.findUniqueOrThrow({ where: { id: user.id } });
+      expect(updatedUser.mustChangePassword).toBe(false);
 
-    const second = await authService.login(
-      { username: user.username, password: "brand-new-password-123" },
-      {},
-    );
-    expect(second.mustChangePassword).toBe(false);
-  });
+      const second = await authService.login(
+        { username: user.username, password: "brand-new-password-123" },
+        {},
+      );
+      expect(second.mustChangePassword).toBe(false);
+    },
+    30_000,
+  );
 
   it("rotates the refresh token on use, linking the new row back to the old one", async () => {
     const user = await createTestUser();

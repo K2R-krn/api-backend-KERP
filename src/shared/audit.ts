@@ -7,6 +7,7 @@ export type Tx = Prisma.TransactionClient;
 export type AuditAction =
   | "create"
   | "update"
+  | "delete"
   | "cancel"
   | "login"
   | "change_password"
