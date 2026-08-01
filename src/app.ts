@@ -5,6 +5,7 @@ import { requireCap } from "./middleware/authorize.js";
 import { branchContext } from "./middleware/branch-context.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
+import { productRouter } from "./modules/products/product.routes.js";
 import { success } from "./shared/envelope.js";
 import { errorHandler } from "./shared/error-handler.js";
 
@@ -33,5 +34,10 @@ app.get("/api/v1/me", authenticate, requireCap("report:view"), branchContext, (r
 // mounted per-write-route (see party.routes.ts) — validation and idempotency are endpoint-scoped,
 // not global app.use() middleware, so nothing extra is mounted here for them.
 app.use("/api/v1/parties", partyRouter);
+
+// Roadmap §4 step 8 — the second master alongside Parties. Unlike Parties, products are a single
+// shared catalog (no branch_id column, TDD §6.5); branchContext still runs per route purely to
+// resolve the acting branch for the audit row, not to scope reads/writes.
+app.use("/api/v1/products", productRouter);
 
 app.use(errorHandler);

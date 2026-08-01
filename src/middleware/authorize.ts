@@ -11,6 +11,7 @@ export type Capability =
   | "branch:manage" // Blueprint doesn't list branch CRUD explicitly; treated like user:manage (root-of-multi-branch, super_admin only).
   | "user:manage"
   | "product:write"
+  | "product:read"
   | "party:write"
   | "party:read"
   | "sale:create"
@@ -33,6 +34,9 @@ const CAN: Record<Capability, Role[]> = {
   "branch:manage": ["super_admin"],
   "user:manage": ["super_admin"],
   "product:write": ["super_admin", "admin"],
+  // Every role needs to look products up while working (billing, payments, reports) — same
+  // reasoning as party:read.
+  "product:read": ["super_admin", "admin", "employee", "accountant"],
   "party:write": ["super_admin", "admin"],
   // Every role needs to look customers/suppliers up while working (billing, payments, reports).
   "party:read": ["super_admin", "admin", "employee", "accountant"],
