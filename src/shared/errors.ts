@@ -14,37 +14,40 @@ export class AppError extends Error {
 }
 
 export class ValidationError extends AppError {
-  constructor(message = "Validation failed", details?: unknown) {
-    super("VALIDATION_ERROR", message, 422, details);
+  constructor(details?: unknown) {
+    super("VALIDATION_ERROR", "Invalid input", 422, details);
   }
 }
 
+// Stable per-throw codes (e.g. USER_INACTIVE, BRANCH_NOT_ALLOWED) are part of the API
+// contract — clients branch on `code`, never on message text (TDD §15.2). Each subclass
+// below takes the specific code as its argument; the message stays a fixed, generic label.
 export class UnauthorizedError extends AppError {
-  constructor(message = "Unauthorized", details?: unknown) {
-    super("UNAUTHORIZED", message, 401, details);
+  constructor(code = "UNAUTHORIZED", details?: unknown) {
+    super(code, "Unauthorized", 401, details);
   }
 }
 
 export class ForbiddenError extends AppError {
-  constructor(message = "Forbidden", details?: unknown) {
-    super("FORBIDDEN", message, 403, details);
+  constructor(code = "FORBIDDEN", details?: unknown) {
+    super(code, "Forbidden", 403, details);
   }
 }
 
 export class NotFoundError extends AppError {
-  constructor(message = "Not found", details?: unknown) {
-    super("NOT_FOUND", message, 404, details);
+  constructor(code = "NOT_FOUND", details?: unknown) {
+    super(code, "Not found", 404, details);
   }
 }
 
 export class ConflictError extends AppError {
-  constructor(message = "Conflict", details?: unknown) {
-    super("CONFLICT", message, 409, details);
+  constructor(code: string, details?: unknown) {
+    super(code, "Conflict", 409, details);
   }
 }
 
 export class BadRequestError extends AppError {
-  constructor(message = "Bad request", details?: unknown) {
-    super("BAD_REQUEST", message, 400, details);
+  constructor(code: string, details?: unknown) {
+    super(code, "Bad request", 400, details);
   }
 }

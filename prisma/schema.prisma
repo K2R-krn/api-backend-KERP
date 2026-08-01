@@ -312,18 +312,22 @@ model Party {
 // ============================================================================
 
 model RefreshToken {
-  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId    String    @map("user_id") @db.Uuid
-  tokenHash String    @map("token_hash")
-  expiresAt DateTime  @map("expires_at") @db.Timestamptz()
-  revokedAt DateTime? @map("revoked_at") @db.Timestamptz()
-  userAgent String?   @map("user_agent")
-  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  tokenHash     String    @map("token_hash")
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz()
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz()
+  userAgent     String?   @map("user_agent")
+  rotatedFromId String?   @map("rotated_from_id") @db.Uuid
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz()
 
-  user User @relation(fields: [userId], references: [id])
+  user        User           @relation(fields: [userId], references: [id])
+  rotatedFrom RefreshToken?  @relation("RefreshTokenRotation", fields: [rotatedFromId], references: [id])
+  rotatedTo   RefreshToken[] @relation("RefreshTokenRotation")
 
   @@index([userId])
   @@index([tokenHash])
+  @@index([rotatedFromId])
   @@map("refresh_tokens")
 }
 

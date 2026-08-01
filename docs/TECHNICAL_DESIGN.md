@@ -736,13 +736,16 @@ export const createProductSchema = z.object({
 | `expires_at` | timestamptz | not null | |
 | `revoked_at` | timestamptz | nullable | Set on rotation, logout, or deactivation. |
 | `user_agent` | text | nullable | Traceability of the session/device. |
+| `rotated_from_id` | uuid | nullable, FK → refresh_tokens.id | Set at creation to the id of the row this one rotated from. Multiple rows may share the same `rotated_from_id` (concurrent grace-window rotations off the same parent, see §11.4) — it's a lineage/forensics pointer, not a uniqueness constraint. |
 | `created_at` | timestamptz | not null default now() | |
 
-- Index `(user_id)` and `(token_hash)`.
+- Index `(user_id)`, `(token_hash)`, and `(rotated_from_id)`.
 
 ### 11.4 Flows
 - **Login** `POST /auth/login` `{ username, password }` → verify hash → if `must_change_password`, respond with a "must change password" state (limited token) → else issue access + refresh, write the refresh row, set `last_login_at`.
-- **Refresh** `POST /auth/refresh` `{ refreshToken }` → look up by hash → if valid, unexpired, not revoked, and user still active: **revoke the old row, issue a new pair** (rotation), return them. **Grace window:** a just-rotated token remains acceptable for **30 seconds** after rotation (returning the same new pair) so two open tabs refreshing simultaneously don't trip theft detection. Re-use *after* the grace window → revoke the whole chain (theft detection).
+- **Refresh** `POST /auth/refresh` `{ refreshToken }` → look up by hash → if valid, unexpired, not revoked, and user still active: **revoke the old row, issue a new pair** (rotation; the new row's `rotated_from_id` points at the old row), return them.
+  **Grace window (30s), corrected:** raw refresh tokens are never stored (only their hash, above) — so a retry can never literally be handed back the exact same raw token another request already received; that value only ever existed in the first response. Instead: if the presented token's row is **already revoked** and that revocation happened **less than 30 seconds ago**, treat it as a legitimate concurrent rotation (e.g. two open tabs racing), not theft — mint the requester their **own** independent new pair (also pointing `rotated_from_id` at the same old row) and do **not** revoke any sibling pair already issued off that row. Both callers end up with their own valid pair; neither breaks the other.
+  **Reuse ≥30 seconds** after revocation → theft detection: **revoke every refresh token belonging to that user** (same blast radius as change-password's revoke-all below, not just the one lineage — a suspected-compromised session shouldn't leave other sessions on trust).
 - **Change password** `POST /auth/change-password` → verify current (or the must-change token), hash new, set `must_change_password = false`, **revoke all** the user's refresh tokens (force re-login elsewhere).
 - **Logout** `POST /auth/logout` → revoke the presented refresh token.
 - **Deactivation** (admin) → set `is_active = false` and revoke all the user's refresh tokens. Their access token dies within 15 min; refresh is dead immediately.

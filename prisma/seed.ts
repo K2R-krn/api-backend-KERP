@@ -1,7 +1,6 @@
-import { PrismaClient } from "@prisma/client";
+import type { Prisma } from "@prisma/client";
 import * as argon2 from "argon2";
-
-const prisma = new PrismaClient();
+import { prisma, runTransaction } from "../src/db/client.js";
 
 // Fixed id so the singleton row (TDD §5.6) is idempotent via upsert.
 const COMPANY_PROFILE_ID = "00000000-0000-0000-0000-000000000001";
@@ -39,7 +38,7 @@ const UNITS = [
   { name: "Piece", symbol: "pc" },
 ] as const;
 
-async function seedAccountGroups(tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0]) {
+async function seedAccountGroups(tx: Prisma.TransactionClient) {
   const idByName = new Map<string, string>();
   for (const group of ACCOUNT_GROUPS) {
     const existing = await tx.accountGroup.findFirst({
@@ -61,7 +60,7 @@ async function seedAccountGroups(tx: Parameters<Parameters<PrismaClient["$transa
   return idByName;
 }
 
-async function seedUnits(tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0]) {
+async function seedUnits(tx: Prisma.TransactionClient) {
   for (const unit of UNITS) {
     const existing = await tx.unit.findFirst({
       where: { name: unit.name, deletedAt: null },
@@ -73,7 +72,7 @@ async function seedUnits(tx: Parameters<Parameters<PrismaClient["$transaction"]>
   }
 }
 
-async function seedCompanyProfile(tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0]) {
+async function seedCompanyProfile(tx: Prisma.TransactionClient) {
   const businessName = requireEnv("SEED_BUSINESS_NAME");
   const legalName = process.env.SEED_BUSINESS_LEGAL_NAME ?? null;
 
@@ -94,7 +93,7 @@ async function seedCompanyProfile(tx: Parameters<Parameters<PrismaClient["$trans
   console.log(`company_profile: created — ${businessName}`);
 }
 
-async function seedSuperAdmin(tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0]) {
+async function seedSuperAdmin(tx: Prisma.TransactionClient) {
   const username = requireEnv("SEED_SUPER_ADMIN_USERNAME");
   const name = requireEnv("SEED_SUPER_ADMIN_NAME");
   const password = requireEnv("SEED_SUPER_ADMIN_PASSWORD");
@@ -129,7 +128,7 @@ async function seedSuperAdmin(tx: Parameters<Parameters<PrismaClient["$transacti
 }
 
 async function seedLedgers(
-  tx: Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0],
+  tx: Prisma.TransactionClient,
   accountGroupIdByName: Map<string, string>,
 ) {
   const expenseGroupId = accountGroupIdByName.get("Direct/Indirect Expenses");
@@ -161,7 +160,7 @@ async function seedLedgers(
 }
 
 async function main() {
-  await prisma.$transaction(
+  await runTransaction(
     async (tx) => {
       const accountGroupIdByName = await seedAccountGroups(tx);
       await seedUnits(tx);
@@ -169,10 +168,8 @@ async function main() {
       await seedSuperAdmin(tx);
       await seedLedgers(tx, accountGroupIdByName);
     },
-    {
-      timeout: 20000, // 20s — generous margin for ~20 round trips over network
-      maxWait: 10000, // time allowed waiting for a transaction slot
-    },
+    // Overrides the shared default (10s/5s) — ~20 round trips across 5 sub-seeders needs more.
+    { timeout: 20_000, maxWait: 10_000 },
   );
 }
 
