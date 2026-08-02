@@ -226,6 +226,9 @@ There are **7 iterations total**; 1–2 are done. The count is a guide, not sacr
 - **Customer identity / dedup:** whether phone becomes a primary identifier (currently name+village; mobile optional). Deferred — non-breaking to enable later.
 - **Mobile framework:** deferred.
 - **Email self-service password reset:** planned future option (admin-reset for now).
+- **`purchase:create` for the Employee role:** Blueprint and TDD conflict on whether Employees can create purchases. Left restrictive (Employee cannot) pending an actual conversation with the business — not resolved by inference. (Enforced in the capability map, `src/middleware/authorize.ts`.)
+- **Discount entry UI: percentage vs absolute-₹.** Storage is already locked (absolute paise per line, TDD §25.2) regardless of the answer — this is a frontend decision, not a backend one.
+- **GSTR-2B matching field requirements for `supplier_invoice_number`/`supplier_invoice_date`** (TDD §25.3): don't guess the exact fields the accountant needs for ITC/purchase-return matching — verify with them before locking that path.
 - (Everything else is locked — see §3.)
 
 ---

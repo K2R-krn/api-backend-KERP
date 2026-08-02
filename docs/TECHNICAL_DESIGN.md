@@ -16,7 +16,7 @@ This doc grows in the same order you'll build. Each iteration is reviewed and lo
 | **1** | Locked stack, repo structure, core conventions, **Phase 0 + Phase 1 data model & schema** (auth, branches, masters) | ✅ locked |
 | **2** | Backend architecture: layered pattern, custom auth, auth/permission/branch middleware, audit logging, idempotency, validation, error handling | ✅ locked |
 | **DC** | **Data-contract addendum (§18–22):** ledger posting sign convention + posting map, weighted-average costing + cost on stock movements, edit-vs-day-close rule, voucher_date/day boundaries, testing strategy | ✅ locked — binds Iterations 3+ |
-| 3 | Transactions: sales/purchases schema + line items, ledger_postings, stock_movements, the atomic Sale/Purchase services, bill edit/cancel, hold/park, last-price recall, printable-invoice payload | planned — next |
+| 3 | Transactions: sales/purchases schema + line items, ledger_postings, stock_movements, the atomic Sale/Purchase services, bill edit/cancel, hold/park, last-price recall, printable-invoice payload | ✅ locked |
 | 4 | Payments, ledgers, outstanding, cash reconciliation | planned |
 | 5 | Returns, adjustments, contra, journal | planned |
 | 6 | Reports & GST exports | planned |
@@ -1096,3 +1096,426 @@ The per-line `tax_classification` (§6.14) already carries everything needed; th
 - **Exempt sales count toward aggregate turnover** (registration, HSN-digit, and e-invoice thresholds) — seed sales are turnover even at 0% tax. Reports must expose the taxable-vs-exempt outward split (the §6.14 classification bucketing already provides it); the accountant uses it for the GSTR-3B proportional ITC reversal on exempt supplies (Rule 42) — the system only supplies the split, never computes the reversal.
 - **E-invoicing (IRN/QR)** becomes mandatory above ₹5 crore AATO — not applicable at this shop's scale; a future feature triggered by growth, not a launch requirement.
 - Gujarat's GST state code is **24** (GSTIN starts with 24) — the value for `branches.state_code`. (RTO codes like "GJ-16" are vehicle registration districts, unrelated to GST.)
+
+---
+
+# Iteration 3 — Transactions
+
+---
+
+## 24. Cross-Cutting Decisions
+
+- **CC-1 — In-sale payment folded into the sale voucher (Model A).** The cash/online/udhar split lives in the sale's own `ledger_postings` (per the locked §18.3 map). No separate `payments` row is created for money taken during a sale. Consequence: **`payments`/`payment_allocations` have no writer in Iteration 3** — their schema is defined now, first written by the Iteration 4 standalone receipt/payment service.
+- **CC-2 — Two immutability regimes (documented §3.1 exceptions):**
+  - `ledger_postings`, `stock_movements` are **append-only** like `audit_logs`: reversal = new rows. Columns: `id`, `created_at`, `created_by` only — no `updated_at`, `deleted_at`, `updated_by`.
+  - `sales`, `purchases`, `payments` keep full common columns but **`deleted_at` is never set** — removal is a `status` transition (cancellation), never a soft-delete.
+  - Line items carry `id` + `created_at` only, **no `deleted_at`** (resolved in §28.3 / T-1: edit replaces the line set rather than soft-deleting, history via the §13 audit snapshot).
+- **CC-3 — Store computed money on headers and lines.** Confirmed invoices are immutable/filed; `taxable`, GST amounts, `discount`, `round_off`, `grand_total` are stored, not recomputed on read. Service is sole writer; golden-math suite (§22.1) guards the stored values.
+- **CC-4 — Polymorphic `(voucher_type, voucher_id)` on both backbones**, no FK — identical to `audit_logs.(entity_type, entity_id)`. Integrity is service-enforced.
+- **CC-5 — `status` lifecycle drives draft/confirm/cancel.** `draft` (parked/held: no invoice number, no postings, no movements, no series increment) → `confirmed` (number allocated + all financial effects) → `cancelled` (number retained, not reused, not deleted; mandatory reason). `invoice_number` is nullable (null while draft).
+- **CC-6 — Project-wide `branch_stock` lock order (deadlock-avoidance invariant).** Every service that locks `branch_stock` rows `FOR UPDATE` — sale, purchase, return, adjustment, transfer, now and future — **must acquire the locks in ascending `product_id` order within the transaction.** This is not a §26-local rule: two different voucher types touching overlapping products with *different* lock orders will deadlock under concurrency. Stated once here so every service inherits the identical ordering rather than re-deriving it.
+
+---
+
+## 25. Schema — Transaction Tables
+
+### 25.1 `sales` (header) — Blueprint §6.1
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `branch_id` | uuid | FK → branches.id, not null | Drives GSTIN, number series, tax state. |
+| `customer_id` | uuid | FK → parties.id, **nullable** | Null = anonymous walk-in. Service rule: **any udhar portion > 0 ⇒ `customer_id` required**. |
+| `customer_name` | text | not null | **Snapshot** — populated even for anonymous sales (quick-add name). Required on every printed invoice (Blueprint §9). |
+| `customer_village` | text | not null | **Snapshot** — same rule. |
+| `voucher_date` | date | not null, default today-in-IST | §21 business date; all reports/day-close filter on this. |
+| `status` | text | not null default `draft`, check in (`draft`,`confirmed`,`cancelled`) | CC-5. |
+| `invoice_number` | text | nullable | Allocated from `number_series` on confirm only. |
+| `financial_year` | text | nullable | Snapshot at confirm (via `fy_start_month` helper on `voucher_date`). |
+| `place_of_supply_state_code` | text | nullable | Snapshot at confirm; GSTR-1 place of supply, protects filed bill if party state later edited. |
+| `document_type` | text | nullable, check in (`tax_invoice`,`bill_of_supply`,`invoice_cum_bos`) | §23.1 derived + **stored on confirm**. |
+| `total_taxable` | bigint | not null default 0 | Stored total, paise. |
+| `total_discount` | bigint | not null default 0 | |
+| `total_cgst` | bigint | not null default 0 | |
+| `total_sgst` | bigint | not null default 0 | |
+| `total_igst` | bigint | not null default 0 | |
+| `round_off` | bigint | not null default 0 | Signed few-paise per §3.11 → Round Off ledger. |
+| `grand_total` | bigint | not null default 0 | `taxable + tax − discount + round_off`. |
+| `paid_cash` | bigint | not null default 0 | |
+| `paid_bank` | bigint | not null default 0 | |
+| `credit_udhar` | bigint | not null default 0 | |
+| `bank_ledger_id` | uuid | FK → ledgers.id, nullable | Required when `paid_bank > 0` (names which bank/UPI ledger). |
+| `notes` | text | nullable | |
+| `cancel_reason` | text | nullable | Required when `status = cancelled`. |
+| `cancelled_at` | timestamptz | nullable | |
+| `cancelled_by` | uuid | nullable | |
+
++ common columns (§3.1); `deleted_at` present but never set (CC-2).
+
+**CHECK constraints (raw SQL in migration, per the `branch_stock.quantity >= 0` precedent):**
+- `paid_cash + paid_bank + credit_udhar = grand_total`.
+
+**Indexes:**
+- Partial unique `(branch_id, financial_year, invoice_number) WHERE invoice_number IS NOT NULL AND deleted_at IS NULL` — unique per branch-FY, tolerates many draft nulls, still covers `cancelled` rows so a number can never be reissued.
+- `(branch_id, voucher_date)` — Day Book / registers.
+- `(customer_id, voucher_date)` — customer history.
+
+### 25.2 `sale_line_items` — Blueprint §6.14
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `sale_id` | uuid | FK → sales.id, not null | |
+| `line_number` | int | not null | Print/display order. |
+| `product_id` | uuid | FK → products.id, not null | |
+| `customer_id` | uuid | nullable, denormalized | = `sales.customer_id`. Recall key. Null on anonymous sales. |
+| `branch_id` | uuid | not null, denormalized | = `sales.branch_id`. |
+| `sale_date` | date | not null, denormalized | = `sales.voucher_date`. |
+| `unit_rate` | bigint | not null | Per-unit rate as entered (recall basis, §6.1.1). |
+| `billed_qty` | numeric(12,3) | not null | |
+| `free_qty` | numeric(12,3) | not null default 0 | Scheme qty: moves stock, zero taxable value. |
+| `discount` | bigint | not null default 0 | Absolute paise, applied pre-GST-split → taxable is net of discount. |
+| `gst_rate` | numeric(5,2) | not null | Snapshot from product (§23.2). |
+| `price_includes_gst` | boolean | not null | Snapshot of effective inclusive/exclusive flag. |
+| `tax_classification` | text | not null, check in (`taxable`,`exempt`,`nil_rated`,`non_gst`) | Snapshot; drives §23.1 + GSTR bucketing. |
+| `hsn_code` | text | nullable | Snapshot (§23.3 + reprint fidelity). |
+| `product_name` | text | nullable | Snapshot for exact reprint if product renamed. |
+| `unit_symbol` | text | nullable | Snapshot. |
+| `taxable_value` | bigint | not null | Computed per §3.11, stored. |
+| `cgst_amount` | bigint | not null default 0 | Computed per §3.11, rounded per line. |
+| `sgst_amount` | bigint | not null default 0 | |
+| `igst_amount` | bigint | not null default 0 | |
+| `line_total` | bigint | not null | `taxable_value + line tax` (free_qty contributes 0). |
+
+Common-columns exception (CC-2): `id`, `created_at` only; **no `deleted_at`** (T-1 — edit replaces the line set, history via §13 audit).
+
+**Index (last-price recall, §6.14):** `(customer_id, product_id, sale_date DESC)`. Recall query additionally joins `sales` and filters `status = 'confirmed'` (excludes drafts/cancelled/returns per §6.1.1). Exact query in §28.1.
+
+**Discount semantics (LOCKED accounting principle):** `discount` stored as absolute paise per line, applied to the line amount **before** the GST split / inclusive back-calc, so stored `taxable_value` is net of trade discount (GSTR-1 consistent). 🅿️ **PARKED (roadmap §9):** the UI mental model (% vs ₹ entry) — resolved at frontend time, storage is the resolved paise amount either way.
+
+### 25.3 `purchases` (header) + `purchase_line_items` — mirror of sales
+
+Identical shape, with these deltas:
+
+- `supplier_id` — **not null** (asymmetry with sales' nullable customer; a payable posting needs the supplier ledger, no anonymous-purchase analogue).
+- No `customer_name`/`customer_village` snapshot; no anonymous case.
+- `supplier_invoice_number` (text, nullable) + `supplier_invoice_date` (date, nullable) — the supplier's own bill identity, distinct from our internal `number_series` voucher number. 🅿️ **PARKED (roadmap §9):** exact GSTR-2B matching field requirements — do not guess; verify with accountant before locking the ITC/purchase-return path.
+- **No negative-stock block** (purchases only add stock, Blueprint §6.2). `branch_stock` row still locked `FOR UPDATE` for the avg-cost recompute (§22.3), just no `quantity ≥ 0` gate.
+- Purchase line `unit_rate` = net purchase cost per unit → feeds §19.1 avg-cost recompute.
+- Purchase line carries `free_qty` (symmetry — a distributor "10+1 free" adds 11 to stock at lower effective cost).
+- Denormalized on lines: `supplier_id`, `branch_id`, `purchase_date`.
+- Recall index: `(supplier_id, product_id, purchase_date DESC)` — last-cost recall.
+
+### 25.4 `payments` (header) — Blueprint §6.3/6.4 (schema now; first writer Iteration 4)
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `branch_id` | uuid | FK → branches.id, not null | |
+| `voucher_date` | date | not null, default today-IST | §21. |
+| `voucher_number` | text | nullable | From `number_series`, `voucher_type ∈ {receipt, payment}`. |
+| `financial_year` | text | nullable | Snapshot at post. |
+| `direction` | text | not null, check in (`receipt`,`payment`) | Receipt = in; Payment = out. |
+| `party_id` | uuid | FK → parties.id, nullable | Null for pure expense payment. |
+| `cash_bank_ledger_id` | uuid | FK → ledgers.id, not null | The money side (branch Cash/Bank ledger). |
+| `counter_ledger_id` | uuid | FK → ledgers.id, nullable | Non-money side when not a party (e.g. expense ledger, §6.12). |
+| `amount` | bigint | not null | Paise. |
+| `reference` | text | nullable | Cheque/UPI ref. |
+| `notes` | text | nullable | |
+| `status` | text | not null default `confirmed`, check in (`confirmed`,`cancelled`) | No draft/park state for payments. |
+| `cancel_reason` | text | nullable | |
+| `cancelled_at` | timestamptz | nullable | |
+| `cancelled_by` | uuid | nullable | |
+
++ common columns; `deleted_at` never set (CC-2).
+
+**CHECK constraint:** exactly one of `party_id` / `counter_ledger_id` is non-null
+(`(party_id IS NOT NULL) <> (counter_ledger_id IS NOT NULL)`).
+
+### 25.5 `payment_allocations`
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `payment_id` | uuid | FK → payments.id, not null | |
+| `sale_id` | uuid | FK → sales.id, nullable | |
+| `purchase_id` | uuid | FK → purchases.id, nullable | |
+| `amount` | bigint | not null | Paise applied to this target. |
+
+`id`, `created_at` only (immutable). Two nullable FKs (not polymorphic) — target set is small/closed and benefits from real FKs.
+
+**CHECK constraint:** exactly one of `sale_id` / `purchase_id` is non-null
+(`(sale_id IS NOT NULL) <> (purchase_id IS NOT NULL)`).
+
+Unallocated remainder (`amount` − Σ allocations) = on-account advance, resolved in Iteration 4; no column here.
+
+### 25.6 `ledger_postings` — §18.1–18.3
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `ledger_id` | uuid | FK → ledgers.id, not null | |
+| `branch_id` | uuid | FK → branches.id, **not null** | §18.2 — always the source voucher's branch, even for shared ledgers. |
+| `amount` | bigint | not null | Signed: **+ debit, − credit** (§18.1). |
+| `voucher_type` | text | not null | `sale`/`purchase`/`receipt`/`payment`/`contra`/`credit_note`/`debit_note`/`journal`/`stock_adjustment`. |
+| `voucher_id` | uuid | not null | Polymorphic, no FK (CC-4). |
+| `voucher_date` | date | not null | §18.2/§21 — report filtering without joining source. |
+| `narration` | text | nullable | Optional per-posting note. |
+| `created_at` | timestamptz | not null default now() | |
+| `created_by` | uuid | nullable | |
+
+Append-only (CC-2): no `updated_at`/`deleted_at`/`updated_by`.
+
+**Service invariants (not columns):**
+- Postings of one voucher sum to exactly zero (§18.1).
+- Zero-amount postings are never written (e.g. no udhar → no customer posting).
+- Posting granularity is **voucher-level aggregate** (one Cr Sales for total taxable, one Cr CGST for total, etc.) — rate-wise/line detail lives in line items, not here.
+- **Postings are written FROM the sale/purchase header's stored `total_*` / payment-split columns, never independently recomputed.** Cr Sales = `−total_taxable`, Cr CGST = `−total_cgst`, Dr Cash = `+paid_cash`, Dr Customer = `+credit_udhar`, etc. This guarantees header totals and posting amounts can never drift — CC-3's stored values are the single source of truth for the postings too, not a parallel computation of them.
+
+**Indexes:** `(ledger_id, voucher_date)` — statements/balances · `(branch_id, voucher_date)` — Day Book / per-branch P&L / per-GSTIN GST · `(voucher_type, voucher_id)` — a voucher's postings.
+
+### 25.7 `stock_movements` — §19.2–19.3
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `product_id` | uuid | FK → products.id, not null | |
+| `branch_id` | uuid | FK → branches.id, not null | |
+| `quantity_delta` | numeric(12,3) | not null | Signed: + in, − out. |
+| `movement_type` | text | not null, check in (`purchase_in`,`sale_out`,`sales_return_in`,`purchase_return_out`,`adjustment_up`,`adjustment_down`,`transfer_out`,`transfer_in`,`sale_reversal_in`) | §19.3, plus `sale_reversal_in` (§28.4) for sale edit/cancel reversal — a forward-addition, not a contradiction of §19.3. |
+| `rate` | bigint | not null | Paise/unit, valuation rate for THIS movement (§19.2). |
+| `value` | bigint | not null | `rate × |qty|` rounded to paise (§19.2). |
+| `voucher_type` | text | not null | Polymorphic source (CC-4). |
+| `voucher_id` | uuid | not null | No FK (CC-4). |
+| `voucher_date` | date | not null | §21. |
+| `reason` | text | nullable | Required for adjustments (Damage/Spillage/Theft/Expiry/Count-Correction/Other); null otherwise. |
+| `reference_movement_id` | uuid | FK → stock_movements.id, nullable | ⚠️ Self-FK for `sales_return_in` → original outbound movement (§19.3 rate linkage). |
+| `avg_cost_after` | bigint | nullable | ⚠️ Snapshot of `branch_stock.avg_cost` after applying this movement — audit trail for the weighted-average engine (§19). |
+| `created_at` | timestamptz | not null default now() | |
+| `created_by` | uuid | nullable | |
+
+Append-only (CC-2): no `updated_at`/`deleted_at`/`updated_by`.
+
+**Notes (not columns):** `branch_stock.quantity` and `avg_cost` are caches updated in the **same transaction** as the movement, under the §22.3 `FOR UPDATE` row lock (every movement type, not just sales). Sale-out quantity = `billed_qty + free_qty`; the sale-out `value` at `avg_cost` **is** COGS (§19.3), even for the free units (scheme margin hit). Stock Valuation = Σ(`quantity × avg_cost`), re-derivable from movements as a cross-check.
+
+**Indexes:** `(branch_id, product_id, voucher_date)` — movement report + valuation · `(voucher_type, voucher_id)` — a voucher's movements.
+
+**Deferred CHECK (do not forget — Iteration 5):** `reason` must become a real CHECK constraint requiring non-null when `movement_type IN (adjustment_up, adjustment_down)`, added when Stock Adjustment (Iteration 5) is designed. Not needed in Iteration 3 — no code here writes adjustment movements — but the constraint belongs with that feature, not silently omitted.
+
+---
+
+## 26. Atomic Sale Service (`confirmSale`)
+
+Applies to the `draft → confirmed` transition (a fresh confirm, or confirming a parked draft — §28.2 covers park mechanics). Everything below runs inside **one** `runTransaction(tx)` with a generous timeout (remote-DB latency; the seed's 20s precedent — this transaction is heavier than any master write). If anything throws, the whole transaction rolls back: no number consumed, no stock moved, no postings, no partial bill. The idempotency key completion is flipped to `completed` **inside this same `tx`** (§14.2), and the failure path deletes the key so the operator can fix input and retry with the same key.
+
+**Inputs** (already Zod-validated at the controller boundary): `branchId`, optional `customerId` + `customerName`/`customerVillage`, `voucherDate`, line array (`productId`, `unitRate`, `billedQty`, `freeQty`, `discount`, and the effective `priceIncludesGst` per line), and the payment split (`paidCash`, `paidBank`, `bankLedgerId?`, `creditUdhar`). Money arrives as integer paise.
+
+### Step order (all in one transaction)
+
+1. **Pre-flight validation (no DB writes yet).**
+   - If `creditUdhar > 0` then `customerId` is required (CC-1 / §25.1 rule) → else `ValidationError`.
+   - If `paidBank > 0` then `bankLedgerId` required.
+   - When `customerId` is provided, confirm the referenced party exists and its `type` is `customer` or `both` — **reject supplier-only parties** (same FK-validation class as the existing `assertUnitExists`/`assertCategoryExists` pattern).
+   - `customerName` + `customerVillage` present (snapshot columns are NOT NULL) — for a chosen party, default them from the party row; for anonymous, they come from quick-add input.
+   - At least one line. Free-only lines (`billedQty = 0, freeQty > 0`) are allowed **within** a sale, but **at least one line must have `billedQty > 0`** — reject a wholly-giveaway sale. A sale where every posting would be skipped as zero-amount, yet still consumes a real GST invoice number, is not a sale; pure samples/giveaways belong in a stock-adjustment or dedicated giveaway flow (not this path).
+   - **Fail fast, before locking anything.**
+
+2. **Lock stock rows — `SELECT … FOR UPDATE`, deterministic order.**
+   - For every distinct `productId` in the lines, `tx.$queryRaw` a `SELECT quantity, avg_cost FROM branch_stock WHERE branch_id = ? AND product_id = ? FOR UPDATE` (§22.3 — Prisma can't express `FOR UPDATE`).
+   - **Lock in ascending `product_id` order (CC-6)** to prevent deadlock between concurrent transactions touching overlapping products.
+   - If a product has **no `branch_stock` row** at this branch, treat as quantity 0 → the negative-stock block will reject it (you can't sell what was never stocked here). Do **not** auto-create the row.
+
+3. **Negative-stock hard-block (Blueprint §6.1).**
+   - For each product, required out-qty = Σ over its lines of (`billedQty + freeQty`). If `required > locked quantity` → `InsufficientStockError` with `{ productId, available, requested }`. Rolls back (nothing written yet anyway). This is safe against oversell precisely because the check reads the row **under the lock** taken in step 2.
+
+4. **GST computation per line (§3.11 rounding, in integer paise).**
+   - **Line gross** = `billedQty × unitRate` (free_qty excluded — zero taxable). Then subtract `discount` → **discounted line amount**.
+   - **Exclusive line:** `taxableValue = discounted line amount`; `lineTax = round(taxableValue × gstRate)`.
+   - **Inclusive line:** `taxableValue = round(discountedLineAmount ÷ (1 + gstRate))`; `lineTax = discountedLineAmount − taxableValue`.
+   - **Round each line's tax to whole paise** (§3.11 step 1). Then split: intra-state → `cgst = sgst = lineTax / 2` (⚠️ **OPEN S-3**: odd-paise halving — see below); inter-state → `igst = lineTax`, cgst = sgst = 0.
+   - **Intra vs inter** decided once per bill: compare `branch.state_code` vs the sale's place-of-supply state (party state, defaulting to branch state for anonymous/local). Snapshot into `sales.place_of_supply_state_code`.
+   - `exempt`/`nil_rated`/`non_gst` lines: tax = 0 regardless of rate.
+   - `lineTotal = taxableValue + lineTax`.
+
+5. **Header totals (sum the rounded line values — never re-round, §3.11 step 3).**
+   - `total_taxable = Σ taxableValue`; `total_cgst = Σ cgst`; `total_sgst = Σ sgst`; `total_igst = Σ igst`; `total_discount = Σ discount`.
+   - **Round-off (§3.11 step 4, only if `company_profile.rounding_mode = nearest_rupee`):** `pre = total_taxable + total_cgst + total_sgst + total_igst`; `grand_total = round to nearest rupee`; `round_off = grand_total − pre` (signed, a few paise).
+   - **Payment-split integrity:** assert `paidCash + paidBank + creditUdhar = grand_total` (the same equality the DB CHECK enforces — checked here to fail with a clean domain error rather than a raw constraint violation). ⚠️ **OPEN S-4**: does the operator enter the split against the pre- or post-round-off total? See below.
+
+6. **Derive `document_type` (§23.1)** from the line classifications + buyer registration (has GSTIN?) and snapshot onto the header.
+
+7. **Allocate invoice number (row-locked, §5.5).**
+   - Derive `financial_year` from `voucherDate` via the `fy_start_month` helper.
+   - `SELECT … FOR UPDATE` the `number_series` row for `(branchId, 'sale', financialYear)`; if none, create it (prefix from config). Increment `current_number`; format `invoice_number`. Snapshot `financial_year` onto the sale.
+   - Under the row lock, two concurrent sales serialize here — no gap/duplicate. **Number is consumed only now, at confirm** — a parked draft never reached this step.
+
+8. **Write the sale header + line items** with all stored computed columns (CC-3) and snapshots (`customer_name/village`, per-line `gst_rate`, `price_includes_gst`, `tax_classification`, `hsn_code`, `product_name`, `unit_symbol`). Status → `confirmed`.
+
+9. **Decrement stock + write `stock_movements` (per §19).**
+   - For each product line: `quantity_delta = −(billedQty + freeQty)`; `movement_type = sale_out`; **`rate = branch_stock.avg_cost`** (COGS, never sale price, §19.3); `value = rate × |qty|` rounded; `avg_cost` **unchanged** on out-movements.
+   - Update `branch_stock.quantity` (the locked row) by the delta; write `avg_cost_after = avg_cost` (unchanged) onto the movement.
+   - ⚠️ **OPEN S-5**: two lines, same product — one merged `sale_out` movement vs one per line. See below.
+
+10. **Write `ledger_postings` (per §18.3 map, FROM the stored header columns — §25.6 rule).**
+    - `+paid_cash` Dr Cash ledger (branch cash) · `+paid_bank` Dr `bank_ledger_id` · `+credit_udhar` Dr customer ledger · `−total_taxable` Cr Sales · then Cr GST: intra `−total_cgst` / `−total_sgst`, inter `−total_igst` · `round_off` → Round Off ledger (sign per §18.3 so the voucher still sums to zero).
+    - **Skip any zero-amount posting.** Every posting carries `branch_id` = sale's branch (§18.2) and `voucher_date`.
+    - **Assert Σ amounts = 0** before leaving the step (§18.1 invariant, also asserted in every transaction test §22.1).
+
+11. **Audit + idempotency, inside the same `tx`.**
+    - `writeAudit(tx, ctx, { action: 'create', entityType: 'sale', entityId })` — **reference-only** for this immutable create (voucher number, party, grand_total) per §13's transaction-entity rule, not a full row snapshot.
+    - Flip the idempotency key to `completed` with the minimal stored response (the sale id) **in this `tx`** (§14.2).
+
+12. **Commit.** Serializer converts BigInt→number at the envelope; response is the created sale (id, invoice_number, totals, payment split).
+
+### Failure / rollback behaviour
+- Any throw at any step → full `tx` rollback: no number consumed (the `number_series` increment rolls back with everything else — **this is why numbering must be inside the transaction, not a side call**), no stock delta, no postings, no audit row, no key completion.
+- Handled error after key insert → error path deletes the idempotency key (§14.2) so a corrected retry reuses it; a mid-flight crash leaves the key `in_progress` and the staleness-takeover path (§14.2, guarded by the ~10s statement timeout) reclaims it.
+- `InsufficientStockError` and `ValidationError` surface as clean domain codes the client branches on; the DB CHECKs (`paid+…=grand_total`) are defense-in-depth that should never fire if step 5 did its job.
+
+### Resolved Decisions (LOCKED)
+- **S-1** — free-only lines allowed within a sale; **≥1 line must have `billedQty > 0`** (wholly-giveaway sales rejected). Enforced in step 1.
+- **S-2** — `branch_stock` locked in ascending `product_id` order — promoted to project-wide invariant **CC-6**.
+- **S-3** — odd-paise split: `cgst = floor(lineTax/2)`, `sgst = lineTax − cgst` (sum exact). Golden-math §22.1 case.
+- **S-4** — payment split is entered against the **post-round-off** grand total; `paid_cash + paid_bank + credit_udhar = grand_total` (locked consequence, matches the DB CHECK).
+- **S-5** — same product across multiple lines → **one merged `sale_out` movement** per (product) per sale; line items stay separate.
+
+---
+
+## 27. Atomic Purchase Service (`confirmPurchase`)
+
+Mirror of `confirmSale`, one `runTransaction`, same failure/rollback discipline, same audit + idempotency-inside-the-transaction pattern. Only the deltas from §26 are stated here — everything unstated is identical.
+
+**Inputs:** `branchId`, `supplierId` (**required** — no anonymous purchase), `voucherDate`, optional `supplierInvoiceNumber` + `supplierInvoiceDate`, line array (`productId`, `unitRate` = net purchase cost/unit, `billedQty`, `freeQty`, `discount`, `priceIncludesGst`), payment split (`paidCash`, `paidBank`, `bankLedgerId?`, `creditToSupplier`).
+
+### Deltas from the Sale service
+
+1. **Pre-flight:**
+   - `supplierId` required; confirm the party exists and `type ∈ {supplier, both}` — **reject customer-only parties** (mirror of the Sale supplier-check, opposite direction).
+   - If `creditToSupplier > 0`, that's the unpaid payable — no extra party requirement beyond `supplierId` (already mandatory).
+   - No "wholly-free" rejection (unlike sales). **Reason for the asymmetry:** a sales invoice number is GST-significant and externally filed (GSTR-1), so burning one on a zero-posting giveaway is wrong (the S-1 restriction); a purchase voucher number is **purely internal** (our own Day Book/audit sequence, never filed under our GSTIN), so an all-free inward consuming one is harmless. An all-free purchase still adds stock and posts nothing to Purchases/GST for the free units.
+
+2. **Lock stock rows — ascending `product_id` order (CC-6).** Same lock, **but no negative-stock block** — purchases only add. The lock is still mandatory: it guards the `avg_cost` read-modify-write against concurrency (§22.3). A missing `branch_stock` row here is **created** (first-ever stock of this product at this branch), unlike sales where its absence is a reject.
+
+3. **GST computation per line:** identical math (inclusive/exclusive, per-line rounding, intra/inter by state), but this is **input GST** (ITC) not output — it changes only which ledgers the postings hit (§27 step 6), not the arithmetic.
+
+4. **Header totals + payment-split integrity:** identical; `paid_cash + paid_bank + credit_to_supplier = grand_total` (same CHECK shape as sales).
+
+5. **Invoice number:** allocate from `number_series` with `voucher_type = 'purchase'` (our internal voucher number — distinct from `supplier_invoice_number`, which is the supplier's own and is stored as-entered, never generated). No `document_type` derivation (that's a sales/GST-invoice concept).
+
+6. **Stock increment + `stock_movements` (§19) — this is where purchases genuinely differ:**
+   - `quantity_delta = +(billedQty + freeQty)`; `movement_type = purchase_in`.
+   - **Free-unit valuation (LOCKED):** total line cost is spread across all inward units (billed + free), so free stock correctly lowers avg cost. Algebraically identical to valuing billed units at cost and free units at zero, since the weighted-average formula depends only on total cost and total quantity added.
+   - **⚠️ Precision / computation-ordering rule (LOCKED — this is the paisa-drift guard):**
+     - `value` is **authoritative and exact**: `value = billed_qty × unit_rate` (the real amount paid — free units cost nothing, so they don't enter `value`). This is the figure that feeds everything.
+     - `rate` is **derived, display/reference only**: `rate = round(value ÷ (billed_qty + free_qty))`, computed **after** `value`.
+     - **`rate` must NEVER be multiplied back** (`rate × qty`) to recompute `value` or to feed the avg-cost formula — that reintroduces the exact rounding drift this rule exists to prevent.
+     - The **avg-cost recompute uses `value` directly**: `new_avg = round( (old_qty × old_avg + value) ÷ (old_qty + in_qty) )`, where `in_qty = billed_qty + free_qty`; `old_qty = 0 ⇒ new_avg = round(value ÷ in_qty)`.
+     - *Worked drift example:* 10 billed + 1 free at ₹100 → `value = 100000` paise exact; `rate = round(100000 ÷ 11) = 9091` paise; `9091 × 11 = 100001 ≠ 100000` — a 1-paisa drift **if the wrong figure fed the formula**. Using `value` directly, there is no drift.
+   - Write `avg_cost_after` onto the movement (the post-recompute value — genuinely changes here, unlike sales).
+   - **§22.1 golden-math requirement:** include a `purchase_in` case with a **fractional remainder** (e.g. the 10+1@₹100 case above, or any qty that doesn't divide evenly), specifically so this drift is caught if the ordering is ever reintroduced. A round-number-only test would not catch it.
+
+7. **`ledger_postings` (§18.3 purchase map, FROM stored header columns):**
+   - `+total_taxable` Dr Purchases · `+total input GST` Dr GST-input (intra `+total_cgst`/`+total_sgst`, inter `+total_igst`) · `−paid_cash` Cr Cash · `−paid_bank` Cr `bank_ledger_id` · `−credit_to_supplier` Cr supplier ledger · round-off → Round Off ledger.
+   - Skip zero-amount postings; every posting carries the purchase's `branch_id` and `voucher_date`; assert Σ = 0.
+
+8. **Audit + idempotency:** identical (`entityType: 'purchase'`, reference-only create audit, key completion in-transaction).
+
+### Resolved Decisions (LOCKED)
+- **P-1** — wholly-free purchases allowed. Reason: purchase voucher numbers are internal-only (never GST-filed), unlike GST-significant sales invoice numbers — so no S-1-style restriction is warranted.
+- **P-2** — free-unit valuation spreads total line cost across (billed + free) units, correctly lowering avg cost. Precision rule locked: `value` exact and authoritative, `rate` derived-after and never multiplied back, avg-cost formula consumes `value` directly. Golden-math §22.1 case with a fractional-remainder line required.
+
+---
+
+## 28. Secondary Features
+
+Everything roadmap §5 requires beyond the two atomic services. Several of these carry the genuine open decisions of the whole iteration, flagged **T-1 … T-8**.
+
+### 28.1 Last-Price / Last-Cost Recall
+
+- **Endpoints:** `GET /customers/:id/products/:productId/last-price?branch_id=` → `{ rate, effectiveRate, date, quantity } | null`; purchase mirror `GET /suppliers/:id/products/:productId/last-cost?branch_id=`.
+- **Query:** seek the `(customer_id, product_id, sale_date DESC)` index (§25.2), join `sales`, filter `sales.status = 'confirmed'` and `sales.deleted_at IS NULL` — **excludes drafts and cancelled** (§6.1.1 "actual sales only, never reversals"). No line-level filter is needed: edited-away lines are physically removed (T-1), so only current lines exist.
+- **Fallback:** none found → return `null`; the client falls back to `product.sale_price`. Endpoint stays pure (no product-price fallback baked in).
+- ⚠️ **T-7a — branch scope.** §6.1.1 says recall is per-branch, but the locked §6.14 index is `(customer_id, product_id, sale_date DESC)` with no `branch_id`. My read: **filter `branch_id = :branch_id` as an extra predicate after the index seek** — cheap, because the (customer, product) seek already narrows to a handful of rows; the locked index stays unchanged. Alternative is promoting `branch_id` into the index (changes a locked Blueprint spec). Recommend the post-seek filter.
+- ⚠️ **T-7b — rate vs net.** §6.1.1 explicitly defers "recall list rate or net-after-discount." My read: prefill the **`unit_rate` as entered** (that field *is* the rate field being pre-filled; discount is a separate off-by-default toggle), and **also** return `effectiveRate = round(line_total ÷ billed_qty)` as display context ("last sold ₹520, effective ₹495 after discount"). So: prefill `rate`, surface `effectiveRate`, don't conflate them.
+- **Prefetch (optional, now-vs-later):** a batch `GET /customers/:id/last-prices?branch_id=` returning a `{productId: rate}` map for the customer's recent items, so selecting a customer pre-loads prices without per-line lag (§6.1.1). Recommend defining the endpoint, deferring implementation until the billing screen needs it.
+
+### 28.2 Hold / Park a Bill
+
+- A parked bill is a `sales` row with `status = 'draft'` + its `sale_line_items`. **Nothing else** — no `invoice_number`, no `number_series` increment, no `ledger_postings`, no `stock_movements`, no stock lock (CC-5).
+- **Park = a plain insert** of the draft header + lines (still carries an `Idempotency-Key` for double-tap safety, but there are no financial effects to protect). Resume/edit-draft = update the draft rows.
+- **Drafts do NOT reserve stock.** The negative-stock block runs only at confirm (§26 step 3), so a draft can become unconfirmable if stock sold out meanwhile — correct behaviour, stated explicitly.
+- **Confirm** = the §26 `confirmSale` algorithm run against an existing draft id (the `draft → confirmed` transition). `confirmSale` therefore accepts **two entry modes**: fresh create-and-confirm, or confirm-existing-draft. Both converge on the same locked step order.
+- ⚠️ **T-2 — draft discard (CC-2 refinement).** Discarding a draft = **soft-delete** (`deleted_at` set) — this is the *one* legitimate use of `deleted_at` on `sales`, and it is **gated to `status = 'draft'`**. A `confirmed` sale is never soft-deleted; its only removal path is cancellation (`status = 'cancelled'`). Recommend as the precise CC-2 refinement.
+
+### 28.3 Line-Item History Model (resolving the CC-2 deferral)
+
+**Line items do NOT get `deleted_at`.** On edit, the line set is **replaced** — superseded rows are deleted and revised rows inserted under the same `sale_id`, in the transaction — and history is preserved by the §13 full-snapshot-on-edit audit, exactly as Blueprint §6.11 states ("preserved in the audit log").
+
+Why not the soft-delete+insert alternative:
+- **`leanDiff` cannot per-line-diff a line array.** §13 defines it as a top-level changed-fields diff; PROJECT_STATUS §7 bug #5 is direct evidence that an array-valued key (`branchIds`) is compared *wholesale*, not element-wise. So a sale edit logs the **entire** before/after line array regardless of storage approach — and §13 already keeps the **full** snapshot on transaction-entity edits (only creates are reference-only). The audit granularity is identical either way; soft-delete buys nothing on history.
+- **Soft-delete would impose a permanent tax:** every future line-reading query (recall, reports, print, anything written months from now) must remember `deleted_at IS NULL` forever or silently double-count — a compounding footgun with no offsetting benefit here.
+- **Principled distinction:** `ledger_postings`/`stock_movements` are append-only *because they are summed to produce balances/valuation* — a forgotten filter there corrupts money. Line items are voucher detail; the money truth lives in postings, so the line set can be replaced safely, with the audit log holding prior versions. The sale **header** is of course never hard-deleted (retains its invoice number and status); only its detail lines are replaced.
+
+### 28.4 Bill Edit / Cancel Workflow
+
+Permission: `sale:editCancel` — super_admin / admin only (already in the capability map). Both run in **one `runTransaction`**: **append-only for postings/movements** (reversal is new rows, originals untouched); **superseded lines are replaced** — deleted and reinserted under the same `sale_id` (T-1) — with history living in the §13 audit snapshot, not in the transactional rows themselves.
+
+**Shared step 1 — the §20 day-close guard:**
+- Reject a direct edit/cancel when the sale's `voucher_date` falls on or before the branch's **last closed day** → caller must use a Credit Note (Iteration 5) or an Admin day-reopen (Iteration 4). GST-filed period → credit-note only.
+- ⚠️ **T-6 — sequencing.** The day-close *state* is built in Iteration 4. In the Iteration-3-only window nothing is closed, so this guard is **present but vacuously permissive** (last-closed-day = none ⇒ every bill editable). Safe, because (a) there's no cash-close to falsify yet and (b) the shop can't go live on Iteration 3 alone (MVP is Phase 0–3, so day-close lands before cutover). Recommend: ship the guard now reading the (initially absent) day-close state; it activates automatically once Iteration 4 populates it.
+
+**Edit (`editSale`):**
+1. §20 guard.
+2. Lock `branch_stock` rows for the **union of old and new line products**, ascending `product_id` (CC-6).
+3. Negative-stock block against the **new** required quantities (net of what the reversal restores).
+4. **Reverse original effects (append-only):** write compensating `stock_movements` restoring the original out-quantities **at the original out-rate** (so avg_cost is neutrally undone), and compensating `ledger_postings` negating every original posting (voucher_type stays `sale`, same `voucher_id` — no enum change needed on postings).
+5. **Re-apply** the revised lines exactly as `confirmSale` steps 4–10 (GST recompute, new stored totals, new `stock_movements`, new `ledger_postings`).
+6. **Replace lines:** delete the superseded `sale_line_items`, insert the revised ones under the same `sale_id` (T-1 — history is in the audit snapshot, not soft-deleted rows).
+7. **Invoice number is retained** (this is an amendment, not a new document); header marked amended (see below); audit stores full before/after (§13 — edits are the case where full snapshots are kept).
+- **`movement_type` enum (T-3, resolved):** the reversal in step 4 uses **`sale_reversal_in`** (added to the §25.7 enum) — `+qty` at the original out-rate, one type serving both edit and cancel. **Purchase edit/cancel is explicitly OUT of Iteration 3 scope** — roadmap §5 lists bill (sale) edit/cancel for Iteration 3 but not a purchase equivalent, and purchase-entry errors are corrected at leisure, not at a live counter. So no `purchaseReversalOut`/`editPurchase`/`cancelPurchase` ships here; `purchase_reversal_out` is deferred to whenever purchase-edit is actually designed. *Consequence to note: until then, a mis-entered purchase has no in-app edit/cancel path in Iteration 3 — an accepted scope call, not a silent gap.*
+- **Partially-paid auto-adjust (T-5, resolved):** on edit, **`paid_cash` / `paid_bank` stay exactly as-is** (real money already moved). `credit_udhar = new_grand_total − paid_cash − paid_bank`, **which may go negative** — a negative udhar is a customer advance and falls straight out of the customer-ledger posting math (a net credit balance on their ledger). The `paid + … = grand_total` CHECK holds by construction. **Allow negative `credit_udhar`** (no non-negativity CHECK); the advance lives as a customer-ledger credit — the single source of truth for balances — rather than a floored-udhar-plus-separate-refund-record. *Worked (§6.11): orig ₹3000 = ₹1000 cash + ₹2000 udhar; remove item → ₹2500 ⇒ udhar 2000→1500. New total ₹800 ⇒ udhar = 800−1000 = −200 ⇒ ₹200 customer advance.*
+
+**Cancel (`cancelSale`):**
+1. §20 guard.
+2. Lock the sale's product rows (CC-6); write compensating `stock_movements` (`sale_reversal_in`, restoring billed+free at original out-rate) and compensating `ledger_postings` (negate all originals).
+3. `status → cancelled`, mandatory `cancel_reason`, `cancelled_at/by`. **Invoice number retained in series — not reused, not deleted** (§6.11 / GST). Reports filter out `cancelled` from totals but the number stays accounted for.
+4. Audit before/after.
+
+### 28.5 Billing Product Search
+
+- `GET /products/search?branch_id=&q=` → products **stocked at this branch** via **INNER JOIN `branch_stock`**, returning product identity + `branch_stock.quantity` (live) + `sale_price`, `gst_rate`, `unit`, `tax_classification` (§6.1). Inner join is deliberate: a product with no stock row at this branch doesn't appear — matching the sale rule that unstocked items can't be billed. Excludes `is_active = false` and soft-deleted products. Uses `products(name)` / `products(hsn_code)` indexes.
+
+### 28.6 Printable-Invoice Payload
+
+- **Read-only, computed at print time** from stored immutable data — no recomputation of money (CC-3), no re-derivation of `document_type` (stored on confirm).
+- **Assembled from:** `company_profile` (business/legal name, logo, terms, footer, rounding mode) + `branch` (name, GSTIN, address, `state_code`) + `sales` header (`invoice_number`, `voucher_date`, customer snapshot `name`/`village`/`gstin`, `place_of_supply_state_code`, `document_type`, stored totals, payment split, `round_off`) + its `sale_line_items` (the current set — edited-away lines are physically gone, T-1) with snapshotted `hsn_code`/`product_name`/`unit_symbol`, qty, `free_qty`, `unit_rate`, `discount`, `taxable_value`, `cgst`/`sgst`/`igst`, `line_total`, `tax_classification` + **amount-in-words** (paise→words helper, computed not stored) + the **derived title** from `document_type` (§23.1: `tax_invoice`→"Tax Invoice", `bill_of_supply`→"Bill of Supply", `invoice_cum_bos`→"Invoice-cum-Bill of Supply").
+- **Amended reprint:** an edited sale reprints its current (revised) lines and is marked **amended**; the original values remain in the audit log (§6.11). ⚠️ minor: an `amended` marker — a boolean/flag on the header set on first edit, or derived from "an edit audit row exists"? My read: derive from audit (no new column) — flag if you'd rather store a flag.
+- ⚠️ **T-8 — registered-buyer mixed case (§23.1 row 4).** For a registered (GSTIN) buyer with mixed taxable+exempt lines, §23.1 strictly wants a Tax Invoice (taxable lines) + a *separate* Bill of Supply (exempt lines) — "rare … acceptable to split." My read: **out of Iteration 3 scope to auto-generate the split document.** Store `document_type` and surface a flag/warning for this rare combination; full split-document generation deferred (near-nonexistent at a farmer counter, and the everyday mixed sale is to *unregistered* buyers → the single `invoice_cum_bos` path already handled). Confirm defer.
+
+### Resolved Decisions (LOCKED)
+- **T-1** — line items get **no `deleted_at`**; edit replaces the line set (delete superseded + insert revised), history via the §13 audit snapshot (matches §6.11). `leanDiff` logs the line array wholesale either way, so soft-delete added no audit value and only a permanent filter tax.
+- **T-2** — draft discard = soft-delete gated to `status='draft'`; confirmed sales never soft-deleted (CC-2 refinement).
+- **T-3** — add `sale_reversal_in` to the §25.7 `movement_type` enum. **Purchase edit/cancel is out of Iteration 3 scope**; `purchase_reversal_out` deferred to when purchase-edit is designed.
+- **T-4** — edit/cancel = append-only reverse-and-reapply (compensating + new postings/movements; originals untouched), same `sale_id`, invoice number retained; lines replaced per T-1.
+- **T-5** — partially-paid edit: `paid_cash`/`paid_bank` fixed; `credit_udhar` may go negative (= customer advance via ledger credit); no non-negativity CHECK.
+- **T-6** — edit/cancel ship in Iteration 3 with the §20 day-close guard present but inert until Iteration 4 populates day-close state.
+- **T-7** — recall: (a) per-branch scope via post-seek `branch_id` filter, locked index unchanged; (b) prefill `unit_rate`, surface `effectiveRate` as context.
+- **T-8** — registered-buyer mixed split-document generation deferred; store `document_type` + surface a flag only.
+
+---
+
+## 29. What Iteration 3 Locks, and What's Next
+
+**Locked this iteration:** the six cross-cutting decisions (CC-1…CC-6) governing payment-in-sale, immutability regimes, stored-vs-recomputed money, polymorphic voucher references, the draft/confirm/cancel lifecycle, and the project-wide `branch_stock` lock order; the full transaction schema (`sales`, `sale_line_items`, `purchases`/`purchase_line_items`, `payments`, `payment_allocations`, `ledger_postings`, `stock_movements`); the atomic `confirmSale` and `confirmPurchase` services — stock locking and negative-stock enforcement, GST computation and rounding, invoice-number allocation, ledger postings derived from stored totals, and in-transaction audit + idempotency (S-1…S-5, P-1…P-2); and the secondary features — last-price/last-cost recall, hold/park, the line-item replace-on-edit history model, the bill edit/cancel workflow (append-only reverse-and-reapply), billing product search, and the printable-invoice payload (T-1…T-8).
+
+**Schema added this iteration:** `sales`, `sale_line_items`, `purchases`, `purchase_line_items`, `payments`, `payment_allocations`, `ledger_postings`, `stock_movements` (§25.1–25.7).
+
+**Iteration 4 will cover:** payments, ledgers, outstanding, and cash reconciliation — this is where `payments`/`payment_allocations` get their first writer (the standalone receipt/payment service, CC-1), where the §20 day-close state that §28.4's edit/cancel guard already reads gets populated, and where ledger balance/statement/outstanding views are built on top of the `ledger_postings` written from Iteration 3 onward.
+
+### 29.1 Carried into Iteration 4 (not resolved this iteration)
+1. **`payments`/`payment_allocations` first writer** is Iteration 4's standalone receipt/payment service (CC-1) — schema is locked now, unused until then.
+2. **Day-close state** (§20) — Iteration 4 populates it; §28.4's guard is already wired to read it.
+3. **`purchase_reversal_out` / purchase edit-cancel** — deferred to whenever purchase-edit is designed (T-3); no in-app correction path for a mis-entered purchase until then.
+4. **Iteration-5 `reason` CHECK** on `stock_movements` (§25.7) — add the non-null-for-adjustments constraint when Stock Adjustment (Iteration 5) is designed.
+
+Open questions needing an actual conversation with the business (not a technical decision) are tracked in `PROJECT_ROADMAP.md` §9, not duplicated here.
