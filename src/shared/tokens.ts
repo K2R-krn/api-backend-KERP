@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import jwt from "jsonwebtoken";
+import type { Prisma } from "@prisma/client";
 import { env } from "../config/env.js";
 import { MUST_CHANGE_PASSWORD_TOKEN_TTL_MS } from "./constants.js";
 import { parseDurationToMs } from "./duration.js";
@@ -71,4 +72,16 @@ export function generateRefreshToken(): { token: string; hash: string } {
 
 export function hashRefreshToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
+}
+
+/**
+ * Revokes every still-active refresh token for a user — the shared "force re-login everywhere"
+ * primitive used by change-password, refresh-token-reuse detection (TDD §11.4), and now user
+ * deactivation/role-change (users module). Always call inside the caller's own transaction.
+ */
+export async function revokeAllRefreshTokens(tx: Prisma.TransactionClient, userId: string): Promise<void> {
+  await tx.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
 }

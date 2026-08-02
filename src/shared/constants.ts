@@ -14,12 +14,14 @@ export const MUST_CHANGE_PASSWORD_TOKEN_TTL_MS = 10 * 60 * 1000;
 // Engineering default, not spec-locked. Prisma's own default (5000ms timeout / 2000ms maxWait)
 // is tight for an interactive transaction over a remote connection (Supabase) once it does more
 // than 2-3 round trips — observed transient "Transaction already closed" failures in
-// party.service.test.ts at ~5.3s for a 4-5-query transaction. Every $transaction call should go
-// through db/client.ts's runTransaction() so this lives in one place instead of being repeated,
-// or silently defaulted to Prisma's tight numbers, at each call site. Free to raise further before
-// Iteration 3's heavier Sale/Purchase transactions land.
-export const TRANSACTION_TIMEOUT_MS = 10_000;
-export const TRANSACTION_MAX_WAIT_MS = 5_000;
+// party.service.test.ts at ~5.3s for a 4-5-query transaction, and again in user.service.test.ts
+// at ~12s for updateUser's branch-replace path (fetch+validate+delete+insert+update+audit+
+// idempotency, up to 7 round trips — the heaviest transaction in the app so far). Every
+// $transaction call should go through db/client.ts's runTransaction() so this lives in one place
+// instead of being repeated, or silently defaulted to Prisma's tight numbers, at each call site.
+// Free to raise further before Iteration 3's heavier Sale/Purchase transactions land.
+export const TRANSACTION_TIMEOUT_MS = 20_000;
+export const TRANSACTION_MAX_WAIT_MS = 8_000;
 
 // 2-digit GST state/UT codes (TDD §3.8) — the "known list" that state_code is validated against.
 export const GST_STATE_CODES = [

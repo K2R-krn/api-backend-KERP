@@ -9,6 +9,7 @@ import { categoryRouter } from "./modules/categories/category.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
 import { productRouter } from "./modules/products/product.routes.js";
 import { unitRouter } from "./modules/units/unit.routes.js";
+import { userRouter } from "./modules/users/user.routes.js";
 import { success } from "./shared/envelope.js";
 import { errorHandler } from "./shared/error-handler.js";
 
@@ -50,5 +51,10 @@ app.use("/api/v1/products", productRouter);
 app.use("/api/v1/branches", branchRouter);
 app.use("/api/v1/categories", categoryRouter);
 app.use("/api/v1/units", unitRouter);
+
+// Roadmap §4 step 8, final piece — Users (TDD §7.1/§7.3). The most security-sensitive module:
+// creates the accounts that create everything else. user:manage is super_admin-only end to end
+// (see authorize.ts); no branchContext, same root-of-config reasoning as Branches.
+app.use("/api/v1/users", userRouter);
 
 app.use(errorHandler);

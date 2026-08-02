@@ -1,13 +1,14 @@
-import * as argon2 from "argon2";
 import { env } from "../../config/env.js";
 import { prisma, runTransaction } from "../../db/client.js";
 import { writeAudit } from "../../shared/audit.js";
 import { REFRESH_GRACE_WINDOW_MS } from "../../shared/constants.js";
 import { parseDurationToMs } from "../../shared/duration.js";
 import { UnauthorizedError } from "../../shared/errors.js";
+import { hashPassword, verifyPassword } from "../../shared/password.js";
 import {
   generateRefreshToken,
   hashRefreshToken,
+  revokeAllRefreshTokens,
   signAccessToken,
   signMustChangePasswordToken,
 } from "../../shared/tokens.js";
@@ -26,7 +27,7 @@ export async function login(input: LoginInput, meta: RequestMeta): Promise<Login
   const user = await prisma.user.findFirst({ where: { username: input.username, deletedAt: null } });
   if (!user || !user.isActive) throw new UnauthorizedError("INVALID_CREDENTIALS");
 
-  const passwordValid = await argon2.verify(user.passwordHash, input.password);
+  const passwordValid = await verifyPassword(user.passwordHash, input.password);
   if (!passwordValid) throw new UnauthorizedError("INVALID_CREDENTIALS");
 
   if (user.mustChangePassword) {
@@ -70,10 +71,7 @@ export async function refresh(input: RefreshInput, meta: RequestMeta): Promise<R
       // Reuse of an already-rotated token outside the grace window — theft detection (TDD §11.4,
       // corrected wording): revoke every refresh token for this user, not just this lineage.
       await runTransaction(async (tx) => {
-        await tx.refreshToken.updateMany({
-          where: { userId: row.userId, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
+        await revokeAllRefreshTokens(tx, row.userId);
         await writeAudit(tx, { userId: row.userId, role }, {
           action: "token_reuse_detected",
           entityType: "user",
@@ -119,11 +117,11 @@ export async function changePassword(input: ChangePasswordInput, actor: ChangePa
 
   if (!user.mustChangePassword) {
     if (!input.currentPassword) throw new UnauthorizedError("CURRENT_PASSWORD_REQUIRED");
-    const valid = await argon2.verify(user.passwordHash, input.currentPassword);
+    const valid = await verifyPassword(user.passwordHash, input.currentPassword);
     if (!valid) throw new UnauthorizedError("INVALID_CREDENTIALS");
   }
 
-  const newHash = await argon2.hash(input.newPassword, { type: argon2.argon2id });
+  const newHash = await hashPassword(input.newPassword);
   const role = user.role as Role;
 
   await runTransaction(async (tx) => {
@@ -132,10 +130,7 @@ export async function changePassword(input: ChangePasswordInput, actor: ChangePa
       data: { passwordHash: newHash, mustChangePassword: false },
     });
     // Force re-login everywhere (TDD §11.4).
-    await tx.refreshToken.updateMany({
-      where: { userId: user.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    await revokeAllRefreshTokens(tx, user.id);
     await writeAudit(tx, { userId: user.id, role }, {
       action: "change_password",
       entityType: "user",
