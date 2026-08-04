@@ -9,7 +9,7 @@
 | Document | What it is | Status |
 |---|---|---|
 | **`BLUEPRINT.md`** (rev 4) | *What & why.* Product/functional spec — features, modules, workflows, confirmed decisions. | Complete & locked. |
-| **`TECHNICAL_DESIGN.md`** (TDD) | *How.* Engineering spec, built iteration by iteration. Iterations 1–2 done. | Iterations 1–2 locked; 3–7 to write. |
+| **`TECHNICAL_DESIGN.md`** (TDD) | *How.* Engineering spec, built iteration by iteration. Iterations 1–3 done. | Iterations 1–3 locked; 4–7 to write. |
 | **`PROJECT_ROADMAP.md`** (this) | *The plan & handoff.* Methodology + full roadmap for iterations 3–7 + where to start. | This doc. |
 
 The Blueprint and TDD are authoritative. This roadmap points into them; if anything ever conflicts, those two win.
@@ -115,7 +115,7 @@ A custom, multi-branch business-management platform to **replace TallyPrime** fo
 
 ## 4. Where to start building (do this first)
 
-You have enough (Blueprint + TDD Iterations 1–2) to build the **foundation + masters (Phase 0 + Phase 1)** now. Concrete first steps, in order:
+Phase 0 + Phase 1 (foundation + masters) were built from Blueprint + TDD Iterations 1–2. Steps taken, in order:
 
 1. **Init the `api-backend` repo** with the structure in TDD §2 (TypeScript, Express, modules/middleware/shared). - DONE
 2. **Create a Supabase project** (free tier). Grab the **pooled** and **direct** connection strings. 
@@ -126,7 +126,7 @@ You have enough (Blueprint + TDD Iterations 1–2) to build the **foundation + m
 7. **Build one master end-to-end as a vertical slice** — Products or Parties — full CRUD through route → controller → service → Prisma, with validation, auth, branch scoping, and audit. **This proves the whole architecture works.**
 8. Then build the remaining masters (branches, users, units, categories, the other of products/parties) + opening-balance/stock import.
 
-When that foundation runs and login + masters work, you're ready for **Iteration 3**.
+Phase 0 + Phase 1 (foundation + masters) are now fully built. Iteration 3 (Transactions) is designed and locked — see `TECHNICAL_DESIGN.md` §24–29. The next action is **building it**: schema first (TDD §25), then the atomic Sale/Purchase services (TDD §26–27), then the secondary features (TDD §28).
 
 ---
 
@@ -237,11 +237,11 @@ There are **7 iterations total**; 1–2 are done. The count is a guide, not sacr
 
 1. **Attach all three documents** to the new conversation: `BLUEPRINT.md`, `TECHNICAL_DESIGN.md`, `PROJECT_ROADMAP.md`.
 2. **Opening prompt suggestion:**
-   > "I'm building the fertilizer-shop management system described in these three docs. Blueprint and TDD Iterations 1–2 are locked. I want to [**start building the Phase 0/1 foundation** / **write TDD Iteration 3 (Transactions)**]. Follow the methodology in the roadmap §2 (design-then-build, review-then-lock, now-vs-later discipline) and keep the docs in lockstep."
+   > "I'm building the fertilizer-shop management system described in these three docs. Blueprint and TDD Iterations 1–3 are locked. I want to **build Iteration 3's code, starting with the schema.** Follow the methodology in the roadmap §2 (design-then-build, review-then-lock, now-vs-later discipline) and keep the docs in lockstep."
 3. **To build first:** ask for help scaffolding the repo, writing `schema.prisma` from TDD §5–6, and the auth + one-master vertical slice (roadmap §4).
-4. **To design next:** ask to write **Iteration 3** per §5 above — it should produce the transaction schema + the atomic Sale/Purchase service design, then be reviewed and locked before building Phase 2.
+4. **To build Iteration 3:** Iteration 3's design is locked (TDD §24–29) — the next step is building it, starting with `schema.prisma` per TDD §25 (the transaction tables), then the atomic Sale/Purchase services (TDD §26–27).
 5. **Keep the loop:** design an iteration → review → lock → build the phase → next iteration.
 
 ---
 
-*End of roadmap. With the Blueprint, the TDD (Iterations 1–2), and this document, the project can be picked up and continued end-to-end.*
+*End of roadmap. With the Blueprint, the TDD (Iterations 1–3), and this document, the project can be picked up and continued end-to-end.*

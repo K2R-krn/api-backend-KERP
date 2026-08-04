@@ -55,12 +55,19 @@ model Branch {
   createdBy String?   @map("created_by") @db.Uuid
   updatedBy String?   @map("updated_by") @db.Uuid
 
-  userBranches UserBranch[]
-  auditLogs    AuditLog[]
-  numberSeries NumberSeries[]
-  ledgers      Ledger[]
-  branchStock  BranchStock[]
-  parties      Party[]
+  userBranches      UserBranch[]
+  auditLogs         AuditLog[]
+  numberSeries      NumberSeries[]
+  ledgers           Ledger[]
+  branchStock       BranchStock[]
+  parties           Party[]
+  sales             Sale[]
+  saleLineItems     SaleLineItem[]
+  purchases         Purchase[]
+  purchaseLineItems PurchaseLineItem[]
+  payments          Payment[]
+  ledgerPostings    LedgerPosting[]
+  stockMovements    StockMovement[]
 
   @@index([code])
   @@map("branches")
@@ -181,6 +188,12 @@ model Ledger {
   branch       Branch?      @relation(fields: [branchId], references: [id])
   parties      Party[]
 
+  salesAsBankLedger       Sale[]
+  purchasesAsBankLedger   Purchase[]
+  paymentsAsCashBank      Payment[]       @relation("PaymentCashBankLedger")
+  paymentsAsCounterLedger Payment[]       @relation("PaymentCounterLedger")
+  ledgerPostings          LedgerPosting[]
+
   @@index([accountGroupId])
   @@index([branchId])
   @@map("ledgers")
@@ -253,6 +266,10 @@ model Product {
   unit        Unit          @relation(fields: [unitId], references: [id])
   branchStock BranchStock[]
 
+  saleLineItems     SaleLineItem[]
+  purchaseLineItems PurchaseLineItem[]
+  stockMovements    StockMovement[]
+
   @@index([categoryId])
   @@index([unitId])
   @@index([name])
@@ -301,6 +318,12 @@ model Party {
   ledger       Ledger @relation(fields: [ledgerId], references: [id])
   owningBranch Branch @relation(fields: [owningBranchId], references: [id])
 
+  salesAsCustomer             Sale[]
+  saleLineItemsAsCustomer     SaleLineItem[]
+  purchasesAsSupplier         Purchase[]
+  purchaseLineItemsAsSupplier PurchaseLineItem[]
+  paymentsAsParty             Payment[]
+
   @@index([ledgerId])
   @@index([owningBranchId])
   @@index([name, village])
@@ -345,4 +368,280 @@ model IdempotencyKey {
 
   @@index([userId])
   @@map("idempotency_keys")
+}
+
+// ============================================================================
+// Iteration 3 — Transactions (TDD §24-29)
+// ============================================================================
+
+model Sale {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  branchId               String    @map("branch_id") @db.Uuid
+  customerId             String?   @map("customer_id") @db.Uuid
+  customerName           String    @map("customer_name")
+  customerVillage        String    @map("customer_village")
+  voucherDate            DateTime  @map("voucher_date") @db.Date
+  status                 String    @default("draft")
+  invoiceNumber          String?   @map("invoice_number")
+  financialYear          String?   @map("financial_year")
+  placeOfSupplyStateCode String?   @map("place_of_supply_state_code")
+  documentType           String?   @map("document_type")
+  totalTaxable           BigInt    @default(0) @map("total_taxable")
+  totalDiscount          BigInt    @default(0) @map("total_discount")
+  totalCgst              BigInt    @default(0) @map("total_cgst")
+  totalSgst              BigInt    @default(0) @map("total_sgst")
+  totalIgst              BigInt    @default(0) @map("total_igst")
+  roundOff               BigInt    @default(0) @map("round_off")
+  grandTotal             BigInt    @default(0) @map("grand_total")
+  paidCash               BigInt    @default(0) @map("paid_cash")
+  paidBank               BigInt    @default(0) @map("paid_bank")
+  creditUdhar            BigInt    @default(0) @map("credit_udhar")
+  bankLedgerId           String?   @map("bank_ledger_id") @db.Uuid
+  notes                  String?
+  cancelReason           String?   @map("cancel_reason")
+  cancelledAt            DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelledBy            String?   @map("cancelled_by") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  branch             Branch              @relation(fields: [branchId], references: [id])
+  customer           Party?              @relation(fields: [customerId], references: [id])
+  bankLedger         Ledger?             @relation(fields: [bankLedgerId], references: [id])
+  lineItems          SaleLineItem[]
+  paymentAllocations PaymentAllocation[]
+
+  @@index([branchId, voucherDate])
+  @@index([customerId, voucherDate])
+  @@index([bankLedgerId])
+  @@map("sales")
+}
+
+model SaleLineItem {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  saleId            String   @map("sale_id") @db.Uuid
+  lineNumber        Int      @map("line_number")
+  productId         String   @map("product_id") @db.Uuid
+  customerId        String?  @map("customer_id") @db.Uuid
+  branchId          String   @map("branch_id") @db.Uuid
+  saleDate          DateTime @map("sale_date") @db.Date
+  unitRate          BigInt   @map("unit_rate")
+  billedQty         Decimal  @map("billed_qty") @db.Decimal(12, 3)
+  freeQty           Decimal  @default(0) @map("free_qty") @db.Decimal(12, 3)
+  discount          BigInt   @default(0)
+  gstRate           Decimal  @map("gst_rate") @db.Decimal(5, 2)
+  priceIncludesGst  Boolean  @map("price_includes_gst")
+  taxClassification String   @map("tax_classification")
+  hsnCode           String?  @map("hsn_code")
+  productName       String?  @map("product_name")
+  unitSymbol        String?  @map("unit_symbol")
+  taxableValue      BigInt   @map("taxable_value")
+  cgstAmount        BigInt   @default(0) @map("cgst_amount")
+  sgstAmount        BigInt   @default(0) @map("sgst_amount")
+  igstAmount        BigInt   @default(0) @map("igst_amount")
+  lineTotal         BigInt   @map("line_total")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  sale     Sale    @relation(fields: [saleId], references: [id])
+  product  Product @relation(fields: [productId], references: [id])
+  customer Party?  @relation(fields: [customerId], references: [id])
+  branch   Branch  @relation(fields: [branchId], references: [id])
+
+  @@index([saleId])
+  @@index([productId])
+  @@index([branchId])
+  @@index([customerId, productId, saleDate(sort: Desc)])
+  @@map("sale_line_items")
+}
+
+model Purchase {
+  id                    String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  branchId              String    @map("branch_id") @db.Uuid
+  supplierId            String    @map("supplier_id") @db.Uuid
+  voucherDate           DateTime  @map("voucher_date") @db.Date
+  status                String    @default("draft")
+  voucherNumber         String?   @map("voucher_number")
+  financialYear         String?   @map("financial_year")
+  supplierInvoiceNumber String?   @map("supplier_invoice_number")
+  supplierInvoiceDate   DateTime? @map("supplier_invoice_date") @db.Date
+  totalTaxable          BigInt    @default(0) @map("total_taxable")
+  totalDiscount         BigInt    @default(0) @map("total_discount")
+  totalCgst             BigInt    @default(0) @map("total_cgst")
+  totalSgst             BigInt    @default(0) @map("total_sgst")
+  totalIgst             BigInt    @default(0) @map("total_igst")
+  roundOff              BigInt    @default(0) @map("round_off")
+  grandTotal            BigInt    @default(0) @map("grand_total")
+  paidCash              BigInt    @default(0) @map("paid_cash")
+  paidBank              BigInt    @default(0) @map("paid_bank")
+  creditToSupplier      BigInt    @default(0) @map("credit_to_supplier")
+  bankLedgerId          String?   @map("bank_ledger_id") @db.Uuid
+  notes                 String?
+  cancelReason          String?   @map("cancel_reason")
+  cancelledAt           DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelledBy           String?   @map("cancelled_by") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  branch             Branch              @relation(fields: [branchId], references: [id])
+  supplier           Party               @relation(fields: [supplierId], references: [id])
+  bankLedger         Ledger?             @relation(fields: [bankLedgerId], references: [id])
+  lineItems          PurchaseLineItem[]
+  paymentAllocations PaymentAllocation[]
+
+  @@index([branchId, voucherDate])
+  @@index([supplierId, voucherDate])
+  @@index([bankLedgerId])
+  @@map("purchases")
+}
+
+model PurchaseLineItem {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  purchaseId        String   @map("purchase_id") @db.Uuid
+  lineNumber        Int      @map("line_number")
+  productId         String   @map("product_id") @db.Uuid
+  supplierId        String   @map("supplier_id") @db.Uuid
+  branchId          String   @map("branch_id") @db.Uuid
+  purchaseDate      DateTime @map("purchase_date") @db.Date
+  unitRate          BigInt   @map("unit_rate")
+  billedQty         Decimal  @map("billed_qty") @db.Decimal(12, 3)
+  freeQty           Decimal  @default(0) @map("free_qty") @db.Decimal(12, 3)
+  discount          BigInt   @default(0)
+  gstRate           Decimal  @map("gst_rate") @db.Decimal(5, 2)
+  priceIncludesGst  Boolean  @map("price_includes_gst")
+  taxClassification String   @map("tax_classification")
+  hsnCode           String?  @map("hsn_code")
+  productName       String?  @map("product_name")
+  unitSymbol        String?  @map("unit_symbol")
+  taxableValue      BigInt   @map("taxable_value")
+  cgstAmount        BigInt   @default(0) @map("cgst_amount")
+  sgstAmount        BigInt   @default(0) @map("sgst_amount")
+  igstAmount        BigInt   @default(0) @map("igst_amount")
+  lineTotal         BigInt   @map("line_total")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id])
+  product  Product  @relation(fields: [productId], references: [id])
+  supplier Party    @relation(fields: [supplierId], references: [id])
+  branch   Branch   @relation(fields: [branchId], references: [id])
+
+  @@index([purchaseId])
+  @@index([productId])
+  @@index([branchId])
+  @@index([supplierId, productId, purchaseDate(sort: Desc)])
+  @@map("purchase_line_items")
+}
+
+model Payment {
+  id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  branchId         String    @map("branch_id") @db.Uuid
+  voucherDate      DateTime  @map("voucher_date") @db.Date
+  voucherNumber    String?   @map("voucher_number")
+  financialYear    String?   @map("financial_year")
+  direction        String
+  partyId          String?   @map("party_id") @db.Uuid
+  cashBankLedgerId String    @map("cash_bank_ledger_id") @db.Uuid
+  counterLedgerId  String?   @map("counter_ledger_id") @db.Uuid
+  amount           BigInt
+  reference        String?
+  notes            String?
+  status           String    @default("confirmed")
+  cancelReason     String?   @map("cancel_reason")
+  cancelledAt      DateTime? @map("cancelled_at") @db.Timestamptz()
+  cancelledBy      String?   @map("cancelled_by") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz()
+  createdBy String?   @map("created_by") @db.Uuid
+  updatedBy String?   @map("updated_by") @db.Uuid
+
+  branch         Branch              @relation(fields: [branchId], references: [id])
+  party          Party?              @relation(fields: [partyId], references: [id])
+  cashBankLedger Ledger              @relation("PaymentCashBankLedger", fields: [cashBankLedgerId], references: [id])
+  counterLedger  Ledger?             @relation("PaymentCounterLedger", fields: [counterLedgerId], references: [id])
+  allocations    PaymentAllocation[]
+
+  @@index([branchId, voucherDate])
+  @@index([partyId])
+  @@index([cashBankLedgerId])
+  @@index([counterLedgerId])
+  @@map("payments")
+}
+
+model PaymentAllocation {
+  id         String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  paymentId  String  @map("payment_id") @db.Uuid
+  saleId     String? @map("sale_id") @db.Uuid
+  purchaseId String? @map("purchase_id") @db.Uuid
+  amount     BigInt
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  payment  Payment   @relation(fields: [paymentId], references: [id])
+  sale     Sale?     @relation(fields: [saleId], references: [id])
+  purchase Purchase? @relation(fields: [purchaseId], references: [id])
+
+  @@index([paymentId])
+  @@index([saleId])
+  @@index([purchaseId])
+  @@map("payment_allocations")
+}
+
+model LedgerPosting {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ledgerId    String   @map("ledger_id") @db.Uuid
+  branchId    String   @map("branch_id") @db.Uuid
+  amount      BigInt
+  voucherType String   @map("voucher_type")
+  voucherId   String   @map("voucher_id") @db.Uuid
+  voucherDate DateTime @map("voucher_date") @db.Date
+  narration   String?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  createdBy String?  @map("created_by") @db.Uuid
+
+  ledger Ledger @relation(fields: [ledgerId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@index([ledgerId, voucherDate])
+  @@index([branchId, voucherDate])
+  @@index([voucherType, voucherId])
+  @@map("ledger_postings")
+}
+
+model StockMovement {
+  id                  String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  productId           String   @map("product_id") @db.Uuid
+  branchId            String   @map("branch_id") @db.Uuid
+  quantityDelta       Decimal  @map("quantity_delta") @db.Decimal(12, 3)
+  movementType        String   @map("movement_type")
+  rate                BigInt
+  value               BigInt
+  voucherType         String   @map("voucher_type")
+  voucherId           String   @map("voucher_id") @db.Uuid
+  voucherDate         DateTime @map("voucher_date") @db.Date
+  reason              String?
+  referenceMovementId String?  @map("reference_movement_id") @db.Uuid
+  avgCostAfter        BigInt?  @map("avg_cost_after")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  createdBy String?  @map("created_by") @db.Uuid
+
+  product           Product         @relation(fields: [productId], references: [id])
+  branch            Branch          @relation(fields: [branchId], references: [id])
+  referenceMovement StockMovement?  @relation("StockMovementReversal", fields: [referenceMovementId], references: [id])
+  reversals         StockMovement[] @relation("StockMovementReversal")
+
+  @@index([branchId, productId, voucherDate])
+  @@index([voucherType, voucherId])
+  @@map("stock_movements")
 }
