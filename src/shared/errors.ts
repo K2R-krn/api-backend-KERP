@@ -51,3 +51,12 @@ export class BadRequestError extends AppError {
     super(code, "Bad request", 400, details);
   }
 }
+
+// TDD §15.1 / §26 step 3 — named separately from the generic BadRequestError because the client
+// needs the structured {productId, available, requested} shape to render a useful message, not
+// just a code.
+export class InsufficientStockError extends AppError {
+  constructor(details: { productId: string; available: number; requested: number }) {
+    super("INSUFFICIENT_STOCK", "Not enough stock", 409, details);
+  }
+}
