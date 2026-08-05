@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { prisma, runTransaction } from "../db/client.js";
-import { allocateVoucherNumber } from "./number-series.js";
+import { allocateVoucherNumber, formatVoucherNumber } from "./number-series.js";
 
 // TDD §22.1: against the real dev DB, no mocks — the row lock and the INSERT...ON CONFLICT race
 // fix are exactly the things under test here.
@@ -90,4 +90,18 @@ describe("allocateVoucherNumber", () => {
     },
     30_000, // generous — two real transactions serializing over the remote DB connection (CLAUDE.md)
   );
+});
+
+describe("formatVoucherNumber", () => {
+  it("zero-pads the sequence number to 4 digits", () => {
+    expect(formatVoucherNumber("MAIN", "2025-26", 1)).toBe("MAIN/2025-26/0001");
+  });
+
+  it("passes the branch code through as-is, no length constraint", () => {
+    expect(formatVoucherNumber("BHM", "2025-26", 42)).toBe("BHM/2025-26/0042");
+  });
+
+  it("does not truncate a sequence number wider than 4 digits", () => {
+    expect(formatVoucherNumber("MAIN", "2025-26", 12345)).toBe("MAIN/2025-26/12345");
+  });
 });

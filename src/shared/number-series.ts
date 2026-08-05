@@ -4,11 +4,21 @@ export interface AllocateVoucherNumberParams {
   branchId: string;
   voucherType: string; // 'sale' | 'purchase' | 'receipt' | 'payment' | ... (TDD §5.5)
   financialYear: string; // caller derives via deriveFinancialYear before calling
+  // Status as of formatVoucherNumber below (PROJECT_ROADMAP.md §9, provisional): currently
+  // written and read back, but NOT consumed by the finalized display format, which derives the
+  // voucher string fresh from branch.code + financialYear + sequenceNumber instead of reading
+  // this column back. TDD §5.5's own example ("e.g. INV/MAIN/2025-26/") describes a
+  // stored-template-then-append-number model that predates that format decision — this column is
+  // the leftover shape of that earlier model, not an accidentally-unused field nobody noticed.
+  // Kept live (not stripped from the row) since number_series is schema-locked from Phase 0 and a
+  // future voucher type or a revised display format could still want a stored per-series prefix;
+  // whether it ever will is genuinely open, not a planned use.
   defaultPrefix: string | null;
   actorId: string;
 }
 
 export interface AllocatedVoucherNumber {
+  // See defaultPrefix above — populated from the row, but unconsumed by formatVoucherNumber today.
   prefix: string | null;
   sequenceNumber: number;
 }
@@ -66,4 +76,15 @@ export async function allocateVoucherNumber(tx: Tx, params: AllocateVoucherNumbe
   });
 
   return { prefix: row.prefix, sequenceNumber };
+}
+
+// PROVISIONAL — confirm before go-live (tracked in PROJECT_ROADMAP.md §9). Format:
+// {branch.code}/{financialYear}/{sequenceNumber, zero-padded to 4 digits}, e.g.
+// "BHM/2025-26/0001" or "MAIN/2025-26/0001". Deliberately takes no prefix argument — this is the
+// decision point where number_series.prefix (see AllocateVoucherNumberParams.defaultPrefix above)
+// goes unconsumed; the display string is derived fresh from branch.code + financialYear +
+// sequenceNumber every call, never from the stored row. The single call site for every voucher
+// type (sale now, purchase/receipt/payment later) so the format only ever needs changing here.
+export function formatVoucherNumber(branchCode: string, financialYear: string, sequenceNumber: number): string {
+  return `${branchCode}/${financialYear}/${String(sequenceNumber).padStart(4, "0")}`;
 }
