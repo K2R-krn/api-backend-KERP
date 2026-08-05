@@ -127,6 +127,9 @@ async function seedSuperAdmin(tx: Prisma.TransactionClient) {
   console.log(`user: created — ${username} (must_change_password = true)`);
 }
 
+// Shared (branch_id null) system ledgers the Sale/Purchase services post to (TDD §18.3, §26 step
+// 10). Returns a name → id map so seedCompanyProfileSystemLedgers can link them without a second
+// lookup pass.
 async function seedLedgers(
   tx: Prisma.TransactionClient,
   accountGroupIdByName: Map<string, string>,
@@ -135,27 +138,105 @@ async function seedLedgers(
   if (!expenseGroupId) {
     throw new Error("Direct/Indirect Expenses account group not found — seed account_groups first");
   }
+  const salesGroupId = accountGroupIdByName.get("Sales Accounts");
+  if (!salesGroupId) {
+    throw new Error("Sales Accounts account group not found — seed account_groups first");
+  }
+  const dutiesGroupId = accountGroupIdByName.get("Duties & Taxes");
+  if (!dutiesGroupId) {
+    throw new Error("Duties & Taxes account group not found — seed account_groups first");
+  }
 
   const ledgers = [
-    { name: "Round Off" },
-    { name: "Stock Loss/Adjustment" },
+    { name: "Round Off", groupId: expenseGroupId },
+    { name: "Stock Loss/Adjustment", groupId: expenseGroupId },
+    { name: "Sales", groupId: salesGroupId },
+    { name: "CGST", groupId: dutiesGroupId },
+    { name: "SGST", groupId: dutiesGroupId },
+    { name: "IGST", groupId: dutiesGroupId },
   ] as const;
 
+  const idByName = new Map<string, string>();
   for (const ledger of ledgers) {
     const existing = await tx.ledger.findFirst({
       where: { name: ledger.name, branchId: null, deletedAt: null },
     });
-    if (!existing) {
-      await tx.ledger.create({
+    const row =
+      existing ??
+      (await tx.ledger.create({
         data: {
           name: ledger.name,
-          accountGroupId: expenseGroupId,
+          accountGroupId: ledger.groupId,
           branchId: null,
           openingBalance: 0n,
         },
-      });
-    }
+      }));
+    idByName.set(ledger.name, row.id);
     console.log(`ledger: ${existing ? "exists" : "created"} — ${ledger.name}`);
+  }
+  return idByName;
+}
+
+// Links company_profile's system-ledger FKs (added alongside branches.cash_ledger_id) to the
+// shared ledgers seeded above. Only fills columns that are still null — never overwrites an
+// operator's manual reassignment.
+async function seedCompanyProfileSystemLedgers(
+  tx: Prisma.TransactionClient,
+  ledgerIdByName: Map<string, string>,
+) {
+  const profile = await tx.companyProfile.findUnique({ where: { id: COMPANY_PROFILE_ID } });
+  if (!profile) {
+    console.log("company_profile: missing — skipping system ledger links");
+    return;
+  }
+
+  const salesLedgerId = profile.salesLedgerId ?? ledgerIdByName.get("Sales");
+  const cgstLedgerId = profile.cgstLedgerId ?? ledgerIdByName.get("CGST");
+  const sgstLedgerId = profile.sgstLedgerId ?? ledgerIdByName.get("SGST");
+  const igstLedgerId = profile.igstLedgerId ?? ledgerIdByName.get("IGST");
+  const roundOffLedgerId = profile.roundOffLedgerId ?? ledgerIdByName.get("Round Off");
+
+  if (
+    profile.salesLedgerId &&
+    profile.cgstLedgerId &&
+    profile.sgstLedgerId &&
+    profile.igstLedgerId &&
+    profile.roundOffLedgerId
+  ) {
+    console.log("company_profile: system ledger links already set");
+    return;
+  }
+
+  await tx.companyProfile.update({
+    where: { id: COMPANY_PROFILE_ID },
+    data: { salesLedgerId, cgstLedgerId, sgstLedgerId, igstLedgerId, roundOffLedgerId },
+  });
+  console.log("company_profile: linked sales/CGST/SGST/IGST/round-off ledgers");
+}
+
+// Backfill for branches created before branches.cash_ledger_id existed (branch.service.ts now
+// creates this ledger inline for every new branch — this only covers pre-existing rows).
+async function seedBranchCashLedgers(tx: Prisma.TransactionClient, accountGroupIdByName: Map<string, string>) {
+  const cashGroupId = accountGroupIdByName.get("Cash-in-Hand");
+  if (!cashGroupId) {
+    throw new Error("Cash-in-Hand account group not found — seed account_groups first");
+  }
+
+  const branches = await tx.branch.findMany({ where: { cashLedgerId: null, deletedAt: null } });
+  for (const branch of branches) {
+    const ledger = await tx.ledger.create({
+      data: {
+        name: `Cash - ${branch.code}`,
+        accountGroupId: cashGroupId,
+        branchId: branch.id,
+        openingBalance: 0n,
+      },
+    });
+    await tx.branch.update({ where: { id: branch.id }, data: { cashLedgerId: ledger.id } });
+    console.log(`branch cash ledger: created — ${branch.code}`);
+  }
+  if (branches.length === 0) {
+    console.log("branch cash ledgers: all branches already linked");
   }
 }
 
@@ -166,9 +247,12 @@ async function main() {
       await seedUnits(tx);
       await seedCompanyProfile(tx);
       await seedSuperAdmin(tx);
-      await seedLedgers(tx, accountGroupIdByName);
+      const ledgerIdByName = await seedLedgers(tx, accountGroupIdByName);
+      await seedCompanyProfileSystemLedgers(tx, ledgerIdByName);
+      await seedBranchCashLedgers(tx, accountGroupIdByName);
     },
-    // Overrides the shared default (10s/5s) — ~20 round trips across 5 sub-seeders needs more.
+    // Overrides the shared default (10s/5s) — round trips grew with the system-ledger backfill
+    // (Iteration 3 confirmSale prerequisite); keep generous per the Mumbai↔Nepal latency note.
     { timeout: 20_000, maxWait: 10_000 },
   );
 }

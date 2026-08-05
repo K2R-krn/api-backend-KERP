@@ -13,6 +13,10 @@ let outsiderEmployee: BranchActor; // has no user_branches rows at all
 let memberBranchId: string;
 
 const createdBranchIds: string[] = [];
+// createBranch now also creates that branch's Cash ledger in the same transaction (TDD §26 step
+// 10 dependency) — track these separately since deleting a branch only nulls ledgers.branch_id
+// (ON DELETE SET NULL), it never removes the ledger row itself.
+const createdCashLedgerIds: string[] = [];
 const createdIdempotencyKeys: string[] = [];
 
 async function newIdempotencyKey(userId: string, scope: string): Promise<string> {
@@ -25,7 +29,7 @@ async function newIdempotencyKey(userId: string, scope: string): Promise<string>
 }
 
 interface CreatedBranch {
-  data: { id: string; code: string; stateCode: string; isActive: boolean };
+  data: { id: string; code: string; stateCode: string; isActive: boolean; cashLedgerId: string };
 }
 
 beforeAll(async () => {
@@ -84,7 +88,16 @@ afterAll(async () => {
   await prisma.auditLog.deleteMany({ where: { userId: { in: [superAdmin.userId, memberEmployee.userId, outsiderEmployee.userId] } } });
   await prisma.userBranch.deleteMany({ where: { userId: memberEmployee.userId } });
   await prisma.branch.deleteMany({ where: { id: { in: createdBranchIds } } });
+  // Deleting the branches above only nulls ledgers.branch_id (ON DELETE SET NULL) — the Cash
+  // ledger rows createBranch made alongside them survive that and must be removed explicitly, or
+  // every test run leaves orphaned "Cash - <code>" ledgers behind.
+  await prisma.ledger.deleteMany({ where: { id: { in: createdCashLedgerIds } } });
   await prisma.user.deleteMany({ where: { id: { in: [superAdmin.userId, memberEmployee.userId, outsiderEmployee.userId] } } });
+
+  const leftoverLedgers = await prisma.ledger.count({ where: { id: { in: createdCashLedgerIds } } });
+  if (leftoverLedgers > 0) {
+    throw new Error(`branch.service.test.ts left ${leftoverLedgers} test Cash ledger(s) behind — cleanup did not fully succeed`);
+  }
 });
 
 describe("branch.service", () => {
@@ -98,6 +111,7 @@ describe("branch.service", () => {
       key,
     )) as CreatedBranch;
     createdBranchIds.push(response.data.id);
+    createdCashLedgerIds.push(response.data.cashLedgerId);
 
     expect(response.data.code).toBe(code);
     expect(response.data.isActive).toBe(true);
@@ -121,6 +135,7 @@ describe("branch.service", () => {
       key1,
     )) as CreatedBranch;
     createdBranchIds.push(first.data.id);
+    createdCashLedgerIds.push(first.data.cashLedgerId);
 
     const key2 = await newIdempotencyKey(superAdmin.userId, "branch:create");
     await expect(
@@ -170,6 +185,7 @@ describe("branch.service", () => {
       createKey,
     )) as CreatedBranch;
     createdBranchIds.push(created.data.id);
+    createdCashLedgerIds.push(created.data.cashLedgerId);
 
     const updateKey = await newIdempotencyKey(superAdmin.userId, "branch:update");
     await branchService.updateBranch(created.data.id, { phone: "9999999999" }, superAdmin, updateKey);
@@ -192,6 +208,7 @@ describe("branch.service", () => {
       createKey,
     )) as CreatedBranch;
     createdBranchIds.push(created.data.id);
+    createdCashLedgerIds.push(created.data.cashLedgerId);
 
     const deactivateKey = await newIdempotencyKey(superAdmin.userId, "branch:deactivate");
     await branchService.deactivateBranch(created.data.id, superAdmin, deactivateKey);

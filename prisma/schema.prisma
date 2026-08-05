@@ -40,14 +40,15 @@ model User {
 }
 
 model Branch {
-  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  name      String
-  code      String
-  gstin     String?
-  stateCode String  @map("state_code")
-  address   String?
-  phone     String?
-  isActive  Boolean @default(true) @map("is_active")
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String
+  code         String
+  gstin        String?
+  stateCode    String  @map("state_code")
+  address      String?
+  phone        String?
+  isActive     Boolean @default(true) @map("is_active")
+  cashLedgerId String? @map("cash_ledger_id") @db.Uuid
 
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
@@ -58,7 +59,8 @@ model Branch {
   userBranches      UserBranch[]
   auditLogs         AuditLog[]
   numberSeries      NumberSeries[]
-  ledgers           Ledger[]
+  ledgers           Ledger[]           @relation("BranchOwnLedgers")
+  cashLedger        Ledger?            @relation("BranchCashLedger", fields: [cashLedgerId], references: [id])
   branchStock       BranchStock[]
   parties           Party[]
   sales             Sale[]
@@ -70,6 +72,7 @@ model Branch {
   stockMovements    StockMovement[]
 
   @@index([code])
+  @@index([cashLedgerId])
   @@map("branches")
 }
 
@@ -127,14 +130,19 @@ model NumberSeries {
 }
 
 model CompanyProfile {
-  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  businessName  String  @map("business_name")
-  legalName     String? @map("legal_name")
-  logoUrl       String? @map("logo_url")
-  invoiceTerms  String? @map("invoice_terms")
-  invoiceFooter String? @map("invoice_footer")
-  roundingMode  String  @default("none") @map("rounding_mode")
-  fyStartMonth  Int     @default(4) @map("fy_start_month")
+  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessName     String  @map("business_name")
+  legalName        String? @map("legal_name")
+  logoUrl          String? @map("logo_url")
+  invoiceTerms     String? @map("invoice_terms")
+  invoiceFooter    String? @map("invoice_footer")
+  roundingMode     String  @default("none") @map("rounding_mode")
+  fyStartMonth     Int     @default(4) @map("fy_start_month")
+  salesLedgerId    String? @map("sales_ledger_id") @db.Uuid
+  cgstLedgerId     String? @map("cgst_ledger_id") @db.Uuid
+  sgstLedgerId     String? @map("sgst_ledger_id") @db.Uuid
+  igstLedgerId     String? @map("igst_ledger_id") @db.Uuid
+  roundOffLedgerId String? @map("round_off_ledger_id") @db.Uuid
 
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
@@ -142,6 +150,17 @@ model CompanyProfile {
   createdBy String?   @map("created_by") @db.Uuid
   updatedBy String?   @map("updated_by") @db.Uuid
 
+  salesLedger    Ledger? @relation("CompanyProfileSalesLedger", fields: [salesLedgerId], references: [id])
+  cgstLedger     Ledger? @relation("CompanyProfileCgstLedger", fields: [cgstLedgerId], references: [id])
+  sgstLedger     Ledger? @relation("CompanyProfileSgstLedger", fields: [sgstLedgerId], references: [id])
+  igstLedger     Ledger? @relation("CompanyProfileIgstLedger", fields: [igstLedgerId], references: [id])
+  roundOffLedger Ledger? @relation("CompanyProfileRoundOffLedger", fields: [roundOffLedgerId], references: [id])
+
+  @@index([salesLedgerId])
+  @@index([cgstLedgerId])
+  @@index([sgstLedgerId])
+  @@index([igstLedgerId])
+  @@index([roundOffLedgerId])
   @@map("company_profile")
 }
 
@@ -185,14 +204,20 @@ model Ledger {
   updatedBy String?   @map("updated_by") @db.Uuid
 
   accountGroup AccountGroup @relation(fields: [accountGroupId], references: [id])
-  branch       Branch?      @relation(fields: [branchId], references: [id])
+  branch       Branch?      @relation("BranchOwnLedgers", fields: [branchId], references: [id])
   parties      Party[]
 
-  salesAsBankLedger       Sale[]
-  purchasesAsBankLedger   Purchase[]
-  paymentsAsCashBank      Payment[]       @relation("PaymentCashBankLedger")
-  paymentsAsCounterLedger Payment[]       @relation("PaymentCounterLedger")
-  ledgerPostings          LedgerPosting[]
+  salesAsBankLedger         Sale[]
+  purchasesAsBankLedger     Purchase[]
+  paymentsAsCashBank        Payment[]        @relation("PaymentCashBankLedger")
+  paymentsAsCounterLedger   Payment[]        @relation("PaymentCounterLedger")
+  ledgerPostings            LedgerPosting[]
+  branchesUsingAsCash       Branch[]         @relation("BranchCashLedger")
+  companyProfilesAsSales    CompanyProfile[] @relation("CompanyProfileSalesLedger")
+  companyProfilesAsCgst     CompanyProfile[] @relation("CompanyProfileCgstLedger")
+  companyProfilesAsSgst     CompanyProfile[] @relation("CompanyProfileSgstLedger")
+  companyProfilesAsIgst     CompanyProfile[] @relation("CompanyProfileIgstLedger")
+  companyProfilesAsRoundOff CompanyProfile[] @relation("CompanyProfileRoundOffLedger")
 
   @@index([accountGroupId])
   @@index([branchId])

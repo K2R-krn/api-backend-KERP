@@ -19,6 +19,8 @@ export interface BranchActor {
 // exists), so branchContext never runs on these routes. Audit rows simply carry a null branch_id
 // for these actions — the column is nullable exactly for cases like this (TDD §5.4).
 
+const CASH_LEDGER_GROUP = "Cash-in-Hand";
+
 // code's uniqueness is enforced by the partial index ux_branches_code_active (soft-delete-safe);
 // surface the violation as a clean conflict instead of a raw DB constraint error.
 function rethrowCodeConflict(err: unknown): never {
@@ -49,7 +51,31 @@ export async function createBranch(
       })
       .catch(rethrowCodeConflict);
 
-    const serialized = serializeBigInt(branch);
+    // Every branch needs its own Cash ledger for the Sale/Purchase services' ledger_postings
+    // (TDD §26 step 10, §18.3). Created here, in the same transaction as the branch — same
+    // "ledger owned by its entity" pattern as party.service.ts's createParty, just sequenced
+    // branch-first-then-ledger-then-link-back, because branches.cash_ledger_id and
+    // ledgers.branch_id point at each other (unlike the deliberately one-directional party/ledger
+    // link, TDD §6.2) — there's no single insert that can satisfy both sides at once.
+    const cashGroup = await tx.accountGroup.findFirstOrThrow({
+      where: { name: CASH_LEDGER_GROUP, deletedAt: null },
+    });
+    const cashLedger = await tx.ledger.create({
+      data: {
+        name: `Cash - ${branch.code}`,
+        accountGroupId: cashGroup.id,
+        branchId: branch.id,
+        openingBalance: 0n,
+        createdBy: actor.userId,
+        updatedBy: actor.userId,
+      },
+    });
+    const linkedBranch = await tx.branch.update({
+      where: { id: branch.id },
+      data: { cashLedgerId: cashLedger.id },
+    });
+
+    const serialized = serializeBigInt({ ...linkedBranch, cashLedger });
 
     await writeAudit(tx, actor, {
       action: "create",
