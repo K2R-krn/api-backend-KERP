@@ -142,6 +142,10 @@ async function seedLedgers(
   if (!salesGroupId) {
     throw new Error("Sales Accounts account group not found — seed account_groups first");
   }
+  const purchasesGroupId = accountGroupIdByName.get("Purchase Accounts");
+  if (!purchasesGroupId) {
+    throw new Error("Purchase Accounts account group not found — seed account_groups first");
+  }
   const dutiesGroupId = accountGroupIdByName.get("Duties & Taxes");
   if (!dutiesGroupId) {
     throw new Error("Duties & Taxes account group not found — seed account_groups first");
@@ -151,6 +155,7 @@ async function seedLedgers(
     { name: "Round Off", groupId: expenseGroupId },
     { name: "Stock Loss/Adjustment", groupId: expenseGroupId },
     { name: "Sales", groupId: salesGroupId },
+    { name: "Purchases", groupId: purchasesGroupId },
     { name: "CGST", groupId: dutiesGroupId },
     { name: "SGST", groupId: dutiesGroupId },
     { name: "IGST", groupId: dutiesGroupId },
@@ -191,6 +196,7 @@ async function seedCompanyProfileSystemLedgers(
   }
 
   const salesLedgerId = profile.salesLedgerId ?? ledgerIdByName.get("Sales");
+  const purchasesLedgerId = profile.purchasesLedgerId ?? ledgerIdByName.get("Purchases");
   const cgstLedgerId = profile.cgstLedgerId ?? ledgerIdByName.get("CGST");
   const sgstLedgerId = profile.sgstLedgerId ?? ledgerIdByName.get("SGST");
   const igstLedgerId = profile.igstLedgerId ?? ledgerIdByName.get("IGST");
@@ -198,6 +204,7 @@ async function seedCompanyProfileSystemLedgers(
 
   if (
     profile.salesLedgerId &&
+    profile.purchasesLedgerId &&
     profile.cgstLedgerId &&
     profile.sgstLedgerId &&
     profile.igstLedgerId &&
@@ -209,9 +216,9 @@ async function seedCompanyProfileSystemLedgers(
 
   await tx.companyProfile.update({
     where: { id: COMPANY_PROFILE_ID },
-    data: { salesLedgerId, cgstLedgerId, sgstLedgerId, igstLedgerId, roundOffLedgerId },
+    data: { salesLedgerId, purchasesLedgerId, cgstLedgerId, sgstLedgerId, igstLedgerId, roundOffLedgerId },
   });
-  console.log("company_profile: linked sales/CGST/SGST/IGST/round-off ledgers");
+  console.log("company_profile: linked sales/purchases/CGST/SGST/IGST/round-off ledgers");
 }
 
 // Backfill for branches created before branches.cash_ledger_id existed (branch.service.ts now

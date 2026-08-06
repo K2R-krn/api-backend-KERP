@@ -181,6 +181,11 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  // Guard against beforeAll never reaching `actor = {...}` (e.g. a DB connection drop on its very
+  // first query) — without this, afterAll's own actor.userId reads below throw a confusing
+  // secondary TypeError on top of whatever killed beforeAll, instead of just the one real error.
+  if (!actor) return;
+
   // Children-before-parents, matching the RESTRICT delete rules on the transaction schema's FKs
   // (prisma/migrations/*/migration.sql) — none of these cascade automatically.
   await prisma.ledgerPosting.deleteMany({ where: { branchId: { in: createdBranchIds } } });
@@ -354,45 +359,54 @@ describe("confirmSale — golden-math suite (TDD §26/§22.1)", () => {
     await assertPostingsSumToZero(response.data.id);
   });
 
-  it("posts CGST+SGST intra-state and IGST inter-state, split correctly", async () => {
-    const intraKey = await newIdempotencyKey("sale:confirm");
-    const intra = (await saleService.confirmSale(
-      {
-        customerId: customerIntraId,
-        voucherDate: VOUCHER_DATE,
-        lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
-        paidCash: money(105_000),
-        paidBank: 0,
-        creditUdhar: 0,
-      },
-      actor,
-      intraKey,
-    )) as SaleResponse;
-    createdSaleIds.push(intra.data.id);
-    expect(intra.data.totalCgst).toBe(2_500);
-    expect(intra.data.totalSgst).toBe(2_500);
-    expect(intra.data.totalIgst).toBe(0);
-    await assertPostingsSumToZero(intra.data.id);
+  it(
+    "posts CGST+SGST intra-state and IGST inter-state, split correctly",
+    async () => {
+      const intraKey = await newIdempotencyKey("sale:confirm");
+      const intra = (await saleService.confirmSale(
+        {
+          customerId: customerIntraId,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: money(105_000),
+          paidBank: 0,
+          creditUdhar: 0,
+        },
+        actor,
+        intraKey,
+      )) as SaleResponse;
+      createdSaleIds.push(intra.data.id);
+      expect(intra.data.totalCgst).toBe(2_500);
+      expect(intra.data.totalSgst).toBe(2_500);
+      expect(intra.data.totalIgst).toBe(0);
+      await assertPostingsSumToZero(intra.data.id);
 
-    const interKey = await newIdempotencyKey("sale:confirm");
-    const inter = (await saleService.confirmSale(
-      {
-        customerId: customerInterId,
-        voucherDate: VOUCHER_DATE,
-        lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
-        paidCash: money(105_000),
-        paidBank: 0,
-        creditUdhar: 0,
-      },
-      actor,
-      interKey,
-    )) as SaleResponse;
-    createdSaleIds.push(inter.data.id);
-    expect(inter.data.totalCgst).toBe(0);
-    expect(inter.data.totalSgst).toBe(0);
-    expect(inter.data.totalIgst).toBe(5_000);
-    await assertPostingsSumToZero(inter.data.id);
-  });
+      const interKey = await newIdempotencyKey("sale:confirm");
+      const inter = (await saleService.confirmSale(
+        {
+          customerId: customerInterId,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: money(105_000),
+          paidBank: 0,
+          creditUdhar: 0,
+        },
+        actor,
+        interKey,
+      )) as SaleResponse;
+      createdSaleIds.push(inter.data.id);
+      expect(inter.data.totalCgst).toBe(0);
+      expect(inter.data.totalSgst).toBe(0);
+      expect(inter.data.totalIgst).toBe(5_000);
+      await assertPostingsSumToZero(inter.data.id);
+    },
+    // Two full sequential confirmSale round-trips (each a multi-step transaction: stock lock,
+    // number-series allocation, header/line writes, stock movement, ledger postings, audit,
+    // idempotency) over the real Nepal<->Mumbai path exceeded the file's 15s default once under a
+    // long full-suite run (CLAUDE.md: generous timeouts on DB-touching tests, not library
+    // defaults) — same explicit-timeout treatment as the concurrency test below.
+    30_000,
+  );
 
   it("splits an ODD line tax floor-to-CGST/remainder-to-SGST (S-3), not just the even cases above", async () => {
     // 1 kg @ 50020 paise, 5% GST, exclusive -> taxable=50020, lineTax=round(50020*0.05)=2501
