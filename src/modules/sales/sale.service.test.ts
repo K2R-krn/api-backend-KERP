@@ -206,7 +206,10 @@ afterAll(async () => {
   if (leftoverSales > 0) {
     throw new Error("sale.service.test.ts left sale rows behind — cleanup did not fully succeed");
   }
-});
+  // This file's getLastPrice/getInvoicePayload additions push createdSaleIds well past what the
+  // golden-math suite alone left to clean up — enough sequential round-trips over the remote
+  // Nepal<->Mumbai path (CLAUDE.md) to exceed vitest.config.ts's global 15s hookTimeout.
+}, 30_000);
 
 describe("sale.validation — approved #1 (customerId/customerName exclusivity)", () => {
   it("rejects customerName/customerVillage supplied alongside customerId", () => {
@@ -709,4 +712,231 @@ describe("sale.validation — approved #7 (zod boundary shape, not the rounding 
     expect(parsed.paidBank).toBe(0);
     expect(parsed.creditUdhar).toBe(0);
   });
+});
+
+describe("getLastPrice — TDD §28.1 sale-side recall", () => {
+  it("returns null when there is no prior confirmed sale for the pair", async () => {
+    const freshCustomer = (await partyService.createParty(
+      { type: "customer", name: `Recall Null Customer ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+      { userId: actor.userId, role: actor.role, branchId },
+      await newIdempotencyKey("party:create"),
+    )) as { data: { id: string; ledger: { id: string } } };
+    createdPartyIds.push(freshCustomer.data.id);
+    createdOtherLedgerIds.push(freshCustomer.data.ledger.id);
+
+    const result = await saleService.getLastPrice(freshCustomer.data.id, productTaxableId, actor);
+    expect(result).toBeNull();
+  });
+
+  it("recalls the most recent confirmed sale's rate, effectiveRate, date, and quantity (hand-worked)", async () => {
+    // 4 @ 12000 paise, discount 2000: gross=48000, taxable=46000, 5% GST -> tax=2300 (cgst/sgst
+    // 1150 each), grandTotal=48300. effectiveRate = round(48300/4) = 12075 (T-7b's formula).
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerId: customerIntraId,
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(12_000), billedQty: 4, freeQty: 0, discount: money(2_000), priceIncludesGst: false }],
+        paidCash: money(48_300),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+    expect(response.data.grandTotal).toBe(48_300); // sanity check on the hand-worked numbers above
+
+    const result = await saleService.getLastPrice(customerIntraId, productTaxableId, actor);
+    expect(result).not.toBeNull();
+    expect(result?.rate).toBe(12_000n); // prefill = unit_rate as entered, not net-of-discount
+    expect(result?.effectiveRate).toBe(12_075n);
+    expect(result?.quantity.toNumber()).toBe(4);
+    expect(result?.date.toISOString().slice(0, 10)).toBe("2026-06-15");
+  });
+
+  it("ignores a parked (draft) sale — only status='confirmed' is recalled", async () => {
+    const draftKey = await newIdempotencyKey("sale:draft");
+    const draft = (await saleService.createDraft(
+      {
+        customerId: customerIntraId,
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productExemptId, unitRate: money(500), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+      },
+      actor,
+      draftKey,
+    )) as SaleResponse;
+    createdSaleIds.push(draft.data.id);
+
+    const result = await saleService.getLastPrice(customerIntraId, productExemptId, actor);
+    expect(result).toBeNull();
+  });
+});
+
+describe("getInvoicePayload — TDD §28.6 printable invoice payload", () => {
+  it("assembles company/branch/sale/line-item data with a derived title and amount in words", async () => {
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerId: customerIntraId,
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(105_000),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+
+    // getInvoicePayload is called directly here (service layer, TDD §22.1) — bigint fields come
+    // back raw, not serializeBigInt'd the way the controller/HTTP response would present them.
+    const payload = (await saleService.getInvoicePayload(response.data.id, actor)) as {
+      company: { businessName: string };
+      branch: { name: string };
+      documentTitle: string;
+      amended: boolean;
+      sale: { id: string; invoiceNumber: string; grandTotal: bigint; customer: { name: string } };
+      lineItems: { productName: string; lineTotal: bigint }[];
+      amountInWords: string;
+    };
+
+    expect(payload.documentTitle).toBe("Tax Invoice"); // all-taxable line, TDD §23.1 row 1
+    expect(payload.amended).toBe(false);
+    expect(payload.sale.id).toBe(response.data.id);
+    expect(payload.sale.invoiceNumber).toBeTruthy();
+    expect(payload.sale.grandTotal).toBe(105_000n);
+    expect(payload.sale.customer.name).toBeTruthy();
+    expect(payload.lineItems).toHaveLength(1);
+    expect(payload.lineItems[0]?.lineTotal).toBe(105_000n);
+    expect(payload.amountInWords).toContain("Rupees");
+    expect(payload.company.businessName).toBeTruthy();
+    expect(payload.branch.name).toContain("Sale Test Branch");
+  }, 30_000);
+
+  it("never surfaces the customer's live GSTIN — no snapshot column exists to freeze it against drift", async () => {
+    // Regression guard for the live-join bug: a buyer who registers for GST AFTER a sale must
+    // never have that later GSTIN appear on a reprint of the earlier bill (it can visibly
+    // contradict a frozen bill_of_supply/tax_invoice document_type). Proven here by giving the
+    // party a real gstin on file and asserting the payload still shows null.
+    const registeredCustomer = (await partyService.createParty(
+      {
+        type: "customer",
+        name: `Registered GSTIN Customer ${randomUUID()}`,
+        village: "Anand",
+        stateCode: "24",
+        gstin: "24AAAAA0000A1Z5",
+        openingBalance: 0,
+      },
+      { userId: actor.userId, role: actor.role, branchId },
+      await newIdempotencyKey("party:create"),
+    )) as { data: { id: string; ledger: { id: string } } };
+    createdPartyIds.push(registeredCustomer.data.id);
+    createdOtherLedgerIds.push(registeredCustomer.data.ledger.id);
+
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerId: registeredCustomer.data.id,
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productExemptId, unitRate: money(500), billedQty: 2, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(1_000),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+
+    const payload = (await saleService.getInvoicePayload(response.data.id, actor)) as {
+      sale: { customer: { gstin: string | null } };
+    };
+    expect(payload.sale.customer.gstin).toBeNull();
+  });
+
+  it("derives Bill of Supply for an all-exempt sale (TDD §23.1 row 2)", async () => {
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerName: "Walk-in",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productExemptId, unitRate: money(500), billedQty: 2, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(1_000),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+
+    const payload = (await saleService.getInvoicePayload(response.data.id, actor)) as { documentTitle: string };
+    expect(payload.documentTitle).toBe("Bill of Supply");
+  });
+
+  it("rejects a draft sale — no invoice number/stored totals exist yet to print", async () => {
+    const draftKey = await newIdempotencyKey("sale:draft");
+    const draft = (await saleService.createDraft(
+      {
+        customerName: "Parked",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+      },
+      actor,
+      draftKey,
+    )) as SaleResponse;
+    createdSaleIds.push(draft.data.id);
+
+    await expect(saleService.getInvoicePayload(draft.data.id, actor)).rejects.toMatchObject({ code: "SALE_NOT_CONFIRMED" });
+  });
+
+  it("reports not-found for a sale outside the actor's branch (branch isolation)", async () => {
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerName: "Walk-in",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(1_050),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+
+    const otherBranchActor: saleService.SaleActor = { ...actor, branchId: noCashBranchId };
+    await expect(saleService.getInvoicePayload(response.data.id, otherBranchActor)).rejects.toMatchObject({ code: "SALE_NOT_FOUND" });
+  });
+
+  it("flags amended:true from an audit_logs update row (editSale/§28.4 isn't built yet — simulated directly)", async () => {
+    const key = await newIdempotencyKey("sale:confirm");
+    const response = (await saleService.confirmSale(
+      {
+        customerName: "Walk-in",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(1_050),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(response.data.id);
+
+    await prisma.auditLog.create({
+      data: { userId: actor.userId, branchId: actor.branchId, action: "update", entityType: "sale", entityId: response.data.id },
+    });
+
+    const payload = (await saleService.getInvoicePayload(response.data.id, actor)) as { amended: boolean };
+    expect(payload.amended).toBe(true);
+  }, 30_000);
 });

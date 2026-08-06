@@ -21,12 +21,20 @@ export type Capability =
   | "unit:read"
   | "sale:create"
   | "sale:editCancel"
+  // TDD §28.1/§28.5/§28.6 read-side features (last-price recall, billing product search, printable
+  // invoice) — same "every role needs to look this up while working" reasoning as product:read.
+  | "sale:read"
   // OPEN ITEM: Blueprint §4 says Employee gets "partial" purchase rights; TDD §7.2's Employee
   // description omits purchases entirely (silence-as-exclusion vs. incomplete enumeration —
   // genuinely unclear which). Left restrictive (super_admin/admin only) pending a business
   // decision on whether counter staff record purchase deliveries — safer to loosen later than
   // to walk back access already relied on.
   | "purchase:create"
+  // Deliberately narrower than sale:read: mirrors purchase:create's existing restriction rather
+  // than product:read's "every role" default. Consequence: Employee cannot use last-cost recall
+  // (§28.1 purchase mirror) at all — the same open item above (Employee has no purchase:create
+  // either, so last-cost recall would serve no purpose for that role today).
+  | "purchase:read"
   | "payment:create"
   | "voucher:create" // contra/journal/notes — Blueprint: Admin ✅, Billing Operator ❌.
   | "stock:adjust"
@@ -52,7 +60,9 @@ const CAN: Record<Capability, Role[]> = {
   "unit:read": ["super_admin", "admin", "employee", "accountant"],
   "sale:create": ["super_admin", "admin", "employee"],
   "sale:editCancel": ["super_admin", "admin"],
+  "sale:read": ["super_admin", "admin", "employee", "accountant"],
   "purchase:create": ["super_admin", "admin"],
+  "purchase:read": ["super_admin", "admin", "accountant"],
   "payment:create": ["super_admin", "admin", "employee"],
   "voucher:create": ["super_admin", "admin"],
   "stock:adjust": ["super_admin", "admin"],

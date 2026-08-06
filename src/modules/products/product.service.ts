@@ -6,7 +6,7 @@ import { ConflictError, NotFoundError } from "../../shared/errors.js";
 import { success } from "../../shared/envelope.js";
 import { serializeBigInt } from "../../shared/serialize.js";
 import type { Role } from "../../shared/types.js";
-import type { CreateProductInput, ListProductsQuery, UpdateProductInput } from "./product.validation.js";
+import type { BillingProductSearchQuery, CreateProductInput, ListProductsQuery, UpdateProductInput } from "./product.validation.js";
 
 export interface ProductActor {
   userId: string;
@@ -125,6 +125,42 @@ export async function listProducts(query: ListProductsQuery) {
   ]);
 
   return { items, total, page: query.page, limit: query.limit };
+}
+
+// TDD §28.5 — billing screen product search. Querying FROM branch_stock (rather than product with
+// an included/filtered relation) is what gives the inner-join semantics: only products that have
+// an actual stock row for this branch can appear at all, matching "unstocked items can't be
+// billed." Searches products(name)/products(hsn_code) only — TDD names those two indexes and no
+// third (sku isn't mentioned), so sku is returned for display but not searched.
+export async function searchBillingProducts(query: BillingProductSearchQuery, actor: { branchId: string }) {
+  const rows = await prisma.branchStock.findMany({
+    where: {
+      branchId: actor.branchId,
+      product: {
+        deletedAt: null,
+        isActive: true,
+        OR: [
+          { name: { contains: query.q, mode: "insensitive" } },
+          { hsnCode: { contains: query.q, mode: "insensitive" } },
+        ],
+      },
+    },
+    include: { product: { include: { unit: true } } },
+    orderBy: { product: { name: "asc" } },
+    take: 20,
+  });
+
+  return rows.map((row) => ({
+    id: row.product.id,
+    name: row.product.name,
+    hsnCode: row.product.hsnCode,
+    sku: row.product.sku,
+    unit: row.product.unit.symbol,
+    salePrice: row.product.salePrice,
+    gstRate: row.product.gstRate,
+    taxClassification: row.product.taxClassification,
+    quantity: row.quantity,
+  }));
 }
 
 export async function updateProduct(

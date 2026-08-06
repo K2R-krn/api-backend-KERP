@@ -190,7 +190,10 @@ afterAll(async () => {
   if (leftoverPurchases > 0) {
     throw new Error("purchase.service.test.ts left purchase rows behind — cleanup did not fully succeed");
   }
-});
+  // getLastCost's additions push createdPurchaseIds past what the golden-math suite alone left to
+  // clean up — raised past vitest.config.ts's global 15s hookTimeout for the same remote-DB-latency
+  // reason as sale.service.test.ts's afterAll.
+}, 30_000);
 
 describe("confirmPurchase — golden-math suite (TDD §27/§22.1)", () => {
   it("computes a basic exclusive-GST purchase exactly (hand-calculated)", async () => {
@@ -589,4 +592,40 @@ describe("confirmPurchase — golden-math suite (TDD §27/§22.1)", () => {
     },
     30_000,
   );
+});
+
+describe("getLastCost — TDD §28.1 purchase-side mirror of sale.service.ts's getLastPrice", () => {
+  it("returns null when there is no prior confirmed purchase for the pair", async () => {
+    const productId = await newProduct(5);
+    const result = await purchaseService.getLastCost(supplierIntraId, productId, actor);
+    expect(result).toBeNull();
+  });
+
+  it("recalls the most recent confirmed purchase's rate, effectiveRate, date, and quantity (hand-worked)", async () => {
+    // 5 @ 8000 paise, no discount: taxable=40000, 5% GST -> tax=2000 (cgst/sgst 1000 each),
+    // grandTotal=42000. effectiveRate = round(42000/5) = 8400 (same T-7b formula as sales).
+    const productId = await newProduct(5);
+    const key = await newIdempotencyKey("purchase:confirm");
+    const response = (await purchaseService.confirmPurchase(
+      {
+        supplierId: supplierIntraId,
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId, unitRate: money(8_000), billedQty: 5, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(42_000),
+        paidBank: 0,
+        creditToSupplier: 0,
+      },
+      actor,
+      key,
+    )) as PurchaseResponse;
+    createdPurchaseIds.push(response.data.id);
+    expect(response.data.grandTotal).toBe(42_000); // sanity check on the hand-worked numbers above
+
+    const result = await purchaseService.getLastCost(supplierIntraId, productId, actor);
+    expect(result).not.toBeNull();
+    expect(result?.rate).toBe(8_000n);
+    expect(result?.effectiveRate).toBe(8_400n);
+    expect(result?.quantity.toNumber()).toBe(5);
+    expect(result?.date.toISOString().slice(0, 10)).toBe("2026-06-15");
+  });
 });

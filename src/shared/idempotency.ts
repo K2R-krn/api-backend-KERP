@@ -19,8 +19,8 @@ function hashRequestBody(body: unknown): string {
  * the service must do that in its own try/catch (see deleteIdempotencyKey below), since only the
  * controller actually awaits the service's outcome.
  *
- * No write endpoint exists yet to wire this into end-to-end (Iteration 3) — this lands the
- * mechanism so every Iteration-3 write endpoint inherits safe-retry for free (TDD §14.2 now-vs-later).
+ * Landed ahead of any write endpoint (product/party first, Iteration 3's sale/purchase routes
+ * later) so every subsequent write endpoint inherits safe-retry for free (TDD §14.2 now-vs-later).
  */
 export const requireIdempotencyKey = (scope: string) =>
   async function idempotencyPrecheck(req: Request, res: Response, next: NextFunction): Promise<void> {

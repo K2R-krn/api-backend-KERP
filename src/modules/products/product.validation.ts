@@ -61,3 +61,10 @@ export const listProductsQuerySchema = z.object({
   createdTo: z.coerce.date().optional(),
 });
 export type ListProductsQuery = z.infer<typeof listProductsQuerySchema>;
+
+// TDD §28.5 — billing screen search. Deliberately no page/limit cursor (this is a type-ahead
+// search box, not a browse list); a flat cap keeps a pathological broad query cheap.
+export const billingProductSearchQuerySchema = z.object({
+  q: z.string().trim().min(1),
+});
+export type BillingProductSearchQuery = z.infer<typeof billingProductSearchQuerySchema>;

@@ -14,6 +14,9 @@ let actor: ProductActor;
 
 const createdProductIds: string[] = [];
 const createdIdempotencyKeys: string[] = [];
+// branch_stock rows created for the searchBillingProducts tests below — must be deleted BEFORE
+// their product (RESTRICT FK), so tracked separately from createdProductIds.
+const createdBranchStockProductIds: string[] = [];
 
 async function newIdempotencyKey(scope: string): Promise<string> {
   const key = randomUUID();
@@ -73,6 +76,10 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+  if (createdBranchStockProductIds.length) {
+    await prisma.branchStock.deleteMany({ where: { branchId, productId: { in: createdBranchStockProductIds } } });
+    createdBranchStockProductIds.length = 0;
+  }
   if (createdProductIds.length) {
     await prisma.product.deleteMany({ where: { id: { in: createdProductIds } } });
     createdProductIds.length = 0;
@@ -319,5 +326,138 @@ describe("product.service", () => {
 
     const page2 = await productService.listProducts({ page: 2, limit: 2, search: `Search ${uniqueTag}` });
     expect(page2.items).toHaveLength(1);
+  });
+});
+
+describe("searchBillingProducts — TDD §28.5 billing screen search", () => {
+  it("only returns products with a branch_stock row at the acting branch (inner-join semantics)", async () => {
+    const uniqueTag = randomUUID().slice(0, 8);
+
+    const stockedKey = await newIdempotencyKey("product:create");
+    const stocked = (await productService.createProduct(
+      {
+        name: `Billing Search ${uniqueTag} Stocked`,
+        unitId,
+        gstRate: 5,
+        taxClassification: "taxable",
+        priceIncludesGst: false,
+        purchasePrice: 0,
+        salePrice: 12_000,
+      },
+      actor,
+      stockedKey,
+    )) as CreatedProduct;
+    createdProductIds.push(stocked.data.id);
+    await prisma.branchStock.create({ data: { branchId, productId: stocked.data.id, quantity: 25, avgCost: 8_000n } });
+    createdBranchStockProductIds.push(stocked.data.id);
+
+    const unstockedKey = await newIdempotencyKey("product:create");
+    const unstocked = (await productService.createProduct(
+      {
+        name: `Billing Search ${uniqueTag} Unstocked`,
+        unitId,
+        gstRate: 5,
+        taxClassification: "taxable",
+        priceIncludesGst: false,
+        purchasePrice: 0,
+        salePrice: 12_000,
+      },
+      actor,
+      unstockedKey,
+    )) as CreatedProduct;
+    createdProductIds.push(unstocked.data.id);
+    // Deliberately no branch_stock row for this one — an unstocked product can't be billed.
+
+    const results = await productService.searchBillingProducts({ q: `Billing Search ${uniqueTag}` }, actor);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.id).toBe(stocked.data.id);
+    expect(results[0]?.quantity.toNumber()).toBe(25);
+    expect(results[0]?.salePrice).toBe(12_000n);
+    expect(results[0]?.gstRate.toNumber()).toBe(5);
+    expect(results[0]?.taxClassification).toBe("taxable");
+    expect(results[0]?.unit).toBeTruthy();
+  });
+
+  it("excludes an inactive (deactivated) product even if stocked at the branch", async () => {
+    const uniqueTag = randomUUID().slice(0, 8);
+    const key = await newIdempotencyKey("product:create");
+    const product = (await productService.createProduct(
+      {
+        name: `Billing Search Inactive ${uniqueTag}`,
+        unitId,
+        gstRate: 5,
+        taxClassification: "taxable",
+        priceIncludesGst: false,
+        purchasePrice: 0,
+        salePrice: 5_000,
+      },
+      actor,
+      key,
+    )) as CreatedProduct;
+    createdProductIds.push(product.data.id);
+    await prisma.branchStock.create({ data: { branchId, productId: product.data.id, quantity: 10, avgCost: 4_000n } });
+    createdBranchStockProductIds.push(product.data.id);
+
+    await productService.deactivateProduct(product.data.id, actor, await newIdempotencyKey("product:deactivate"));
+
+    const results = await productService.searchBillingProducts({ q: `Billing Search Inactive ${uniqueTag}` }, actor);
+    expect(results).toHaveLength(0);
+  });
+
+  it("matches on hsn_code as well as name", async () => {
+    const uniqueHsn = `9${Date.now().toString().slice(-7)}`; // synthetic, collision-unlikely 8-digit HSN
+    const key = await newIdempotencyKey("product:create");
+    const product = (await productService.createProduct(
+      {
+        name: `Billing Search HSN Match ${randomUUID().slice(0, 6)}`,
+        hsnCode: uniqueHsn,
+        unitId,
+        gstRate: 5,
+        taxClassification: "taxable",
+        priceIncludesGst: false,
+        purchasePrice: 0,
+        salePrice: 5_000,
+      },
+      actor,
+      key,
+    )) as CreatedProduct;
+    createdProductIds.push(product.data.id);
+    await prisma.branchStock.create({ data: { branchId, productId: product.data.id, quantity: 3, avgCost: 4_000n } });
+    createdBranchStockProductIds.push(product.data.id);
+
+    const results = await productService.searchBillingProducts({ q: uniqueHsn }, actor);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.id).toBe(product.data.id);
+  });
+
+  it("scopes to the acting branch — a stock row at a different branch is not returned", async () => {
+    const otherBranch = await prisma.branch.create({
+      data: { name: `Other Search Branch ${randomUUID()}`, code: `OSB${randomUUID().slice(0, 6)}`, stateCode: "24" },
+    });
+    try {
+      const uniqueTag = randomUUID().slice(0, 8);
+      const key = await newIdempotencyKey("product:create");
+      const product = (await productService.createProduct(
+        {
+          name: `Billing Search Other Branch ${uniqueTag}`,
+          unitId,
+          gstRate: 5,
+          taxClassification: "taxable",
+          priceIncludesGst: false,
+          purchasePrice: 0,
+          salePrice: 5_000,
+        },
+        actor,
+        key,
+      )) as CreatedProduct;
+      createdProductIds.push(product.data.id);
+      await prisma.branchStock.create({ data: { branchId: otherBranch.id, productId: product.data.id, quantity: 7, avgCost: 4_000n } });
+
+      const results = await productService.searchBillingProducts({ q: `Billing Search Other Branch ${uniqueTag}` }, actor);
+      expect(results).toHaveLength(0);
+    } finally {
+      await prisma.branchStock.deleteMany({ where: { branchId: otherBranch.id } });
+      await prisma.branch.delete({ where: { id: otherBranch.id } });
+    }
   });
 });

@@ -1,10 +1,11 @@
 import { Prisma } from "@prisma/client";
-import { runTransaction } from "../../db/client.js";
+import { prisma, runTransaction } from "../../db/client.js";
 import { writeAudit, type Tx } from "../../shared/audit.js";
 import { completeIdempotencyKey } from "../../shared/idempotency.js";
 import { BadRequestError, ConflictError, InsufficientStockError, NotFoundError } from "../../shared/errors.js";
 import { success } from "../../shared/envelope.js";
 import { serializeBigInt } from "../../shared/serialize.js";
+import { amountInWords } from "../../shared/amount-in-words.js";
 import { deriveFinancialYear } from "../../shared/financial-year.js";
 import { allocateVoucherNumber, formatVoucherNumber } from "../../shared/number-series.js";
 import type { Role } from "../../shared/types.js";
@@ -746,4 +747,142 @@ export async function confirmSale(input: ConfirmSaleInput, actor: SaleActor, ide
     // 20s default (CLAUDE.md: generous timeouts on DB work).
     { timeout: 30_000 },
   );
+}
+
+// ============================================================================
+// getLastPrice — TDD §28.1 sale-side recall. Post-seek branch filter (T-7a): the locked
+// (customer_id, product_id, sale_date DESC) index (§6.14/§25.2) stays unchanged; branch_id is an
+// extra predicate Postgres applies while walking the index-ordered rows, not a second index. No
+// party-existence precheck — an unknown/foreign customerId just yields no matching lines, same
+// outcome as "no prior sale" (§28.1 "endpoint stays pure").
+// ============================================================================
+
+export interface LastPriceResult {
+  rate: bigint;
+  effectiveRate: bigint;
+  date: Date;
+  quantity: Prisma.Decimal;
+}
+
+export async function getLastPrice(customerId: string, productId: string, actor: SaleActor): Promise<LastPriceResult | null> {
+  const line = await prisma.saleLineItem.findFirst({
+    where: {
+      customerId,
+      productId,
+      branchId: actor.branchId,
+      sale: { status: "confirmed", deletedAt: null },
+    },
+    // saleDate alone isn't a fully deterministic order on same-day repeat purchases — createdAt
+    // is the tiebreaker (TDD doesn't discuss ties; this is the obvious resolution).
+    orderBy: [{ saleDate: "desc" }, { createdAt: "desc" }],
+  });
+  if (!line) return null;
+
+  // T-7b (locked): rate = unit_rate as entered (prefill); effectiveRate = round(line_total ÷
+  // billed_qty) as separate display context, never fed back into a field.
+  const billedQtyMilli = qtyToMilli(line.billedQty.toNumber());
+  const effectiveRate = billedQtyMilli > 0 ? divRoundHalfUp(line.lineTotal * 1000n, BigInt(billedQtyMilli)) : 0n;
+
+  return { rate: line.unitRate, effectiveRate, date: line.saleDate, quantity: line.billedQty };
+}
+
+// ============================================================================
+// getInvoicePayload — TDD §28.6. Pure read/assembly at print time. company_profile/branch
+// identity and the customer's live GSTIN are looked up fresh (a reprint should reflect the
+// current letterhead, and there's no customer_gstin column on `sales` to freeze — §25.1 only
+// denormalizes name/village). Every money figure and document_type come from the stored, frozen
+// sale header/lines and are never recomputed or re-derived (CC-3). Guarded on `status !==
+// "draft"` rather than `=== "confirmed"` so a future cancelSale (§28.4, not built yet) doesn't
+// require revisiting this guard — a cancelled sale keeps its stored totals/lines untouched
+// (§28.4 cancel step 3) and stays legitimately reprintable, marked cancelled.
+// ============================================================================
+
+const DOCUMENT_TITLES: Record<string, string> = {
+  tax_invoice: "Tax Invoice",
+  bill_of_supply: "Bill of Supply",
+  invoice_cum_bos: "Invoice-cum-Bill of Supply",
+};
+
+export async function getInvoicePayload(saleId: string, actor: SaleActor): Promise<unknown> {
+  const sale = await prisma.sale.findFirst({
+    where: { id: saleId, deletedAt: null },
+    include: { lineItems: { orderBy: { lineNumber: "asc" } } },
+  });
+  // Branch mismatch reports as not-found, same posture as loadDraftWorkingInput/party.getParty.
+  if (!sale || sale.branchId !== actor.branchId) throw new NotFoundError("SALE_NOT_FOUND");
+  if (sale.status === "draft") throw new ConflictError("SALE_NOT_CONFIRMED", { status: sale.status });
+
+  const [branch, companyProfile, amendedCount] = await Promise.all([
+    prisma.branch.findFirst({ where: { id: sale.branchId, deletedAt: null } }),
+    prisma.companyProfile.findFirst({ where: { deletedAt: null } }),
+    // "Amended" marker (§28.6, resolved per the design session): derived from an audit_logs EXISTS
+    // check (entity_type='sale', action='update') rather than a stored flag — avoids a redundant
+    // column for something the audit trail already proves.
+    prisma.auditLog.count({ where: { entityType: "sale", entityId: saleId, action: "update" } }),
+  ]);
+  if (!branch) throw new NotFoundError("BRANCH_NOT_FOUND");
+  if (!companyProfile) throw new ConflictError("COMPANY_PROFILE_NOT_CONFIGURED");
+
+  return {
+    company: {
+      businessName: companyProfile.businessName,
+      legalName: companyProfile.legalName,
+      logoUrl: companyProfile.logoUrl,
+      invoiceTerms: companyProfile.invoiceTerms,
+      invoiceFooter: companyProfile.invoiceFooter,
+    },
+    branch: { name: branch.name, gstin: branch.gstin, address: branch.address, stateCode: branch.stateCode },
+    documentTitle: DOCUMENT_TITLES[sale.documentType ?? ""] ?? sale.documentType,
+    amended: amendedCount > 0,
+    sale: {
+      id: sale.id,
+      invoiceNumber: sale.invoiceNumber,
+      voucherDate: sale.voucherDate,
+      status: sale.status,
+      documentType: sale.documentType,
+      placeOfSupplyStateCode: sale.placeOfSupplyStateCode,
+      customer: {
+        id: sale.customerId,
+        name: sale.customerName,
+        village: sale.customerVillage,
+        // Deliberately NOT a live join to the party's current GSTIN — that's exactly the drift
+        // document_type is frozen to avoid (a buyer who registered for GST after this sale would
+        // make an old bill_of_supply reprint show a real GSTIN, a legally-relevant contradiction).
+        // There's no customer_gstin snapshot column on `sales` (§25.1 only denormalizes
+        // name/village), so there is genuinely nothing frozen to show here today — surfacing null
+        // rather than live/possibly-wrong data. A real fix needs a schema addition (a
+        // customer_gstin snapshot column written at confirm time, mirroring customer_name/
+        // customer_village) — flagged, not silently added, per CLAUDE.md's schema-change rule.
+        gstin: null as string | null,
+      },
+      totalTaxable: sale.totalTaxable,
+      totalDiscount: sale.totalDiscount,
+      totalCgst: sale.totalCgst,
+      totalSgst: sale.totalSgst,
+      totalIgst: sale.totalIgst,
+      roundOff: sale.roundOff,
+      grandTotal: sale.grandTotal,
+      paidCash: sale.paidCash,
+      paidBank: sale.paidBank,
+      creditUdhar: sale.creditUdhar,
+    },
+    lineItems: sale.lineItems.map((li) => ({
+      lineNumber: li.lineNumber,
+      productId: li.productId,
+      productName: li.productName,
+      hsnCode: li.hsnCode,
+      unitSymbol: li.unitSymbol,
+      billedQty: li.billedQty,
+      freeQty: li.freeQty,
+      unitRate: li.unitRate,
+      discount: li.discount,
+      taxClassification: li.taxClassification,
+      taxableValue: li.taxableValue,
+      cgstAmount: li.cgstAmount,
+      sgstAmount: li.sgstAmount,
+      igstAmount: li.igstAmount,
+      lineTotal: li.lineTotal,
+    })),
+    amountInWords: amountInWords(sale.grandTotal),
+  };
 }

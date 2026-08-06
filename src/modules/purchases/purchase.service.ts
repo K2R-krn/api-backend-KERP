@@ -1,5 +1,5 @@
 import { Prisma } from "@prisma/client";
-import { runTransaction } from "../../db/client.js";
+import { prisma, runTransaction } from "../../db/client.js";
 import { writeAudit, type Tx } from "../../shared/audit.js";
 import { completeIdempotencyKey } from "../../shared/idempotency.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../../shared/errors.js";
@@ -586,4 +586,35 @@ export async function confirmPurchase(input: ConfirmPurchaseInput, actor: Purcha
     // document_type derivation).
     { timeout: 30_000 },
   );
+}
+
+// ============================================================================
+// getLastCost — TDD §28.1 purchase-side mirror of sale.service.ts's getLastPrice. Same post-seek
+// branch filter (T-7a) over the locked (supplier_id, product_id, purchase_date DESC) index
+// (§6.14/§25.3), same "no supplier-existence precheck, endpoint stays pure" reasoning.
+// ============================================================================
+
+export interface LastCostResult {
+  rate: bigint;
+  effectiveRate: bigint;
+  date: Date;
+  quantity: Prisma.Decimal;
+}
+
+export async function getLastCost(supplierId: string, productId: string, actor: PurchaseActor): Promise<LastCostResult | null> {
+  const line = await prisma.purchaseLineItem.findFirst({
+    where: {
+      supplierId,
+      productId,
+      branchId: actor.branchId,
+      purchase: { status: "confirmed", deletedAt: null },
+    },
+    orderBy: [{ purchaseDate: "desc" }, { createdAt: "desc" }],
+  });
+  if (!line) return null;
+
+  const billedQtyMilli = qtyToMilli(line.billedQty.toNumber());
+  const effectiveRate = billedQtyMilli > 0 ? divRoundHalfUp(line.lineTotal * 1000n, BigInt(billedQtyMilli)) : 0n;
+
+  return { rate: line.unitRate, effectiveRate, date: line.purchaseDate, quantity: line.billedQty };
 }

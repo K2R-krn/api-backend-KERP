@@ -8,6 +8,8 @@ import * as productController from "./product.controller.js";
 export const productRouter = Router();
 
 productRouter.get("/", authenticate, requireCap("product:read"), branchContext, productController.list);
+// Must be registered before "/:id" — otherwise Express would match "search" as an :id param.
+productRouter.get("/search", authenticate, requireCap("sale:read"), branchContext, productController.searchBilling);
 productRouter.get("/:id", authenticate, requireCap("product:read"), branchContext, productController.get);
 
 productRouter.post(

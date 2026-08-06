@@ -5,7 +5,7 @@ import { parseWithSchema } from "../../shared/validate.js";
 import { serializeBigInt } from "../../shared/serialize.js";
 import * as productService from "./product.service.js";
 import type { ProductActor } from "./product.service.js";
-import { createProductSchema, listProductsQuerySchema, updateProductSchema } from "./product.validation.js";
+import { billingProductSearchQuerySchema, createProductSchema, listProductsQuerySchema, updateProductSchema } from "./product.validation.js";
 
 // branchContext always runs before these controllers (see product.routes.ts) and rejects the
 // request before reaching here if auth/branchId are missing — safe to assert.
@@ -32,6 +32,12 @@ export async function list(req: Request, res: Response): Promise<void> {
   res.json(
     success(serializeBigInt(result.items), { total: result.total, page: result.page, limit: result.limit }),
   );
+}
+
+export async function searchBilling(req: Request, res: Response): Promise<void> {
+  const query = parseWithSchema(billingProductSearchQuerySchema, req.query);
+  const results = await productService.searchBillingProducts(query, actorFrom(req));
+  res.json(success(serializeBigInt(results)));
 }
 
 export async function get(req: Request, res: Response): Promise<void> {

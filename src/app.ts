@@ -8,6 +8,8 @@ import { branchRouter } from "./modules/branches/branch.routes.js";
 import { categoryRouter } from "./modules/categories/category.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
 import { productRouter } from "./modules/products/product.routes.js";
+import { purchaseRouter } from "./modules/purchases/purchase.routes.js";
+import { saleRouter } from "./modules/sales/sale.routes.js";
 import { unitRouter } from "./modules/units/unit.routes.js";
 import { userRouter } from "./modules/users/user.routes.js";
 import { success } from "./shared/envelope.js";
@@ -56,5 +58,12 @@ app.use("/api/v1/units", unitRouter);
 // creates the accounts that create everything else. user:manage is super_admin-only end to end
 // (see authorize.ts); no branchContext, same root-of-config reasoning as Branches.
 app.use("/api/v1/users", userRouter);
+
+// Iteration 3 (TDD §24-29) — the atomic confirmSale/confirmPurchase/createDraft services (built
+// and tested against the real dev DB in prior sessions) plus this session's read-side secondary
+// features (§28.1 recall, §28.5 billing search — mounted on productRouter above, §28.6 printable
+// payload) get their first HTTP wiring here.
+app.use("/api/v1/sales", saleRouter);
+app.use("/api/v1/purchases", purchaseRouter);
 
 app.use(errorHandler);

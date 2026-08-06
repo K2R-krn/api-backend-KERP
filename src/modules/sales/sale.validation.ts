@@ -98,3 +98,8 @@ export type ConfirmSaleInput = ConfirmDraftSaleInput | ConfirmFreshSaleInput;
 export function isDraftConfirm(input: ConfirmSaleInput): input is ConfirmDraftSaleInput {
   return "draftId" in input;
 }
+
+// HTTP boundary only (TDD §28.2 "confirmSale accepts two entry modes") — the service itself
+// stays typed on the narrower ConfirmSaleInput union; this just lets the controller validate
+// either shape from one POST /sales/confirm body via parseWithSchema.
+export const confirmSaleSchema = z.union([confirmDraftSaleSchema, confirmFreshSaleSchema]);
