@@ -28,13 +28,15 @@ export type SaleLineInput = z.infer<typeof saleLineInputSchema>;
 // snapshot — the caller must not also supply them (avoids the caller silently believing an
 // override took effect). When customerId is absent (anonymous sale), both become required
 // free-text input.
-const saleCustomerFields = {
+export const saleCustomerFields = {
   customerId: z.string().uuid().optional(),
   customerName: z.string().trim().min(1).optional(),
   customerVillage: z.string().trim().min(1).optional(),
 };
 
-function refineCustomerFields<T extends { customerId?: string; customerName?: string; customerVillage?: string }>(
+// Exported for editSale (TDD §28.4) — the design session approved letting edit change the
+// customer too, on the same anonymous-XOR-named shape confirmSale already enforces.
+export function refineCustomerFields<T extends { customerId?: string; customerName?: string; customerVillage?: string }>(
   input: T,
   ctx: z.RefinementCtx,
 ): void {
@@ -103,3 +105,24 @@ export function isDraftConfirm(input: ConfirmSaleInput): input is ConfirmDraftSa
 // stays typed on the narrower ConfirmSaleInput union; this just lets the controller validate
 // either shape from one POST /sales/confirm body via parseWithSchema.
 export const confirmSaleSchema = z.union([confirmDraftSaleSchema, confirmFreshSaleSchema]);
+
+// editSale (TDD §28.4): the caller submits the full replacement line set (T-1 — lines are
+// replaced, not diffed) and, per the design session, may also correct the customer. voucherDate
+// is deliberately NOT here — confirmed fixed (never editable), so invoice_number/financial_year
+// can never drift out of the FY they were allocated in. Payment split is not here either —
+// paid_cash/paid_bank/bank_ledger_id are frozen from the original sale and credit_udhar is
+// derived server-side (T-5), never caller-supplied.
+export const editSaleSchema = z
+  .object({
+    ...saleCustomerFields,
+    lines: z.array(saleLineInputSchema).min(1),
+  })
+  .superRefine(refineCustomerFields);
+export type EditSaleInput = z.infer<typeof editSaleSchema>;
+
+// cancelSale (TDD §28.4 / §25.1): cancel_reason is mandatory on cancellation (schema note "Required
+// when status = cancelled") even though the column itself is nullable at the DB level.
+export const cancelSaleSchema = z.object({
+  cancelReason: z.string().trim().min(1),
+});
+export type CancelSaleInput = z.infer<typeof cancelSaleSchema>;

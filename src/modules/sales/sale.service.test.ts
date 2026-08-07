@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import type { NextFunction, Request, Response } from "express";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { prisma } from "../../db/client.js";
+import { requireCap } from "../../middleware/authorize.js";
+import type { Role } from "../../shared/types.js";
 import * as partyService from "./../parties/party.service.js";
 import * as saleService from "./sale.service.js";
 import type { SaleActor } from "./sale.service.js";
-import { confirmFreshSaleSchema, createDraftSaleSchema } from "./sale.validation.js";
+import { cancelSaleSchema, confirmFreshSaleSchema, createDraftSaleSchema } from "./sale.validation.js";
 
 // TDD §22.1: service-layer tests run against the real dev DB, no mocks — the row lock, the
 // GST math, and the ledger/stock side effects are exactly the things under test here.
@@ -88,6 +91,13 @@ async function assertPostingsSumToZero(saleId: string) {
   const sum = postings.reduce((acc, p) => acc + p.amount, 0n);
   expect(sum).toBe(0n);
   return postings;
+}
+
+// §28.4 edit/cancel suite — a ledger's running balance is just the sum of every posting against
+// it (TDD §7, no separate stored-balance column).
+async function ledgerBalance(ledgerId: string): Promise<bigint> {
+  const postings = await prisma.ledgerPosting.findMany({ where: { ledgerId } });
+  return postings.reduce((sum, p) => sum + p.amount, 0n);
 }
 
 beforeAll(async () => {
@@ -915,7 +925,7 @@ describe("getInvoicePayload — TDD §28.6 printable invoice payload", () => {
     await expect(saleService.getInvoicePayload(response.data.id, otherBranchActor)).rejects.toMatchObject({ code: "SALE_NOT_FOUND" });
   });
 
-  it("flags amended:true from an audit_logs update row (editSale/§28.4 isn't built yet — simulated directly)", async () => {
+  it("flags amended:true from an audit_logs update row (simulated directly — editSale's own coverage is in the §28.4 suite below)", async () => {
     const key = await newIdempotencyKey("sale:confirm");
     const response = (await saleService.confirmSale(
       {
@@ -939,4 +949,532 @@ describe("getInvoicePayload — TDD §28.6 printable invoice payload", () => {
     const payload = (await saleService.getInvoicePayload(response.data.id, actor)) as { amended: boolean };
     expect(payload.amended).toBe(true);
   }, 30_000);
+});
+
+describe("sale:editCancel capability — Blueprint §6.11 (Super Admin/Admin only, never Employee)", () => {
+  it("allows super_admin and admin, rejects employee and accountant", () => {
+    const next: NextFunction = () => undefined;
+    for (const role of ["super_admin", "admin"] satisfies Role[]) {
+      const req = { auth: { userId: "x", role, branchId: "y" } } as unknown as Request;
+      expect(() => requireCap("sale:editCancel")(req, {} as Response, next)).not.toThrow();
+    }
+    for (const role of ["employee", "accountant"] satisfies Role[]) {
+      const req = { auth: { userId: "x", role, branchId: "y" } } as unknown as Request;
+      expect(() => requireCap("sale:editCancel")(req, {} as Response, next)).toThrow();
+    }
+  });
+});
+
+describe("editSale / cancelSale — TDD §28.4 (bill edit/cancel workflow)", () => {
+  it("rejects editing or cancelling a draft sale", async () => {
+    const draftKey = await newIdempotencyKey("sale:draft");
+    const draft = (await saleService.createDraft(
+      {
+        customerName: "Parked",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+      },
+      actor,
+      draftKey,
+    )) as SaleResponse;
+    createdSaleIds.push(draft.data.id);
+
+    const editKey = await newIdempotencyKey("sale:edit");
+    await expect(
+      saleService.editSale(
+        draft.data.id,
+        { lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 2, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKey,
+      ),
+    ).rejects.toMatchObject({ code: "SALE_NOT_CONFIRMED", details: { status: "draft" } });
+
+    const cancelKey = await newIdempotencyKey("sale:cancel");
+    await expect(saleService.cancelSale(draft.data.id, { cancelReason: "test" }, actor, cancelKey)).rejects.toMatchObject({
+      code: "SALE_NOT_CONFIRMED",
+      details: { status: "draft" },
+    });
+  });
+
+  it("rejects editing or cancelling an already-cancelled sale", async () => {
+    const key = await newIdempotencyKey("sale:confirm");
+    const sale = (await saleService.confirmSale(
+      {
+        customerName: "Walk-in",
+        customerVillage: "Anand",
+        voucherDate: VOUCHER_DATE,
+        lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        paidCash: money(1_050),
+        paidBank: 0,
+        creditUdhar: 0,
+      },
+      actor,
+      key,
+    )) as SaleResponse;
+    createdSaleIds.push(sale.data.id);
+
+    const cancelKey = await newIdempotencyKey("sale:cancel");
+    await saleService.cancelSale(sale.data.id, { cancelReason: "wrong entry" }, actor, cancelKey);
+
+    const editKey = await newIdempotencyKey("sale:edit");
+    await expect(
+      saleService.editSale(
+        sale.data.id,
+        { lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 2, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKey,
+      ),
+    ).rejects.toMatchObject({ code: "SALE_NOT_CONFIRMED", details: { status: "cancelled" } });
+
+    const cancelAgainKey = await newIdempotencyKey("sale:cancel");
+    await expect(saleService.cancelSale(sale.data.id, { cancelReason: "again" }, actor, cancelAgainKey)).rejects.toMatchObject({
+      code: "SALE_NOT_CONFIRMED",
+      details: { status: "cancelled" },
+    });
+  });
+
+  it("cancelSaleSchema requires a non-empty cancel_reason", () => {
+    expect(cancelSaleSchema.safeParse({}).success).toBe(false);
+    expect(cancelSaleSchema.safeParse({ cancelReason: "" }).success).toBe(false);
+    expect(cancelSaleSchema.safeParse({ cancelReason: "customer changed mind" }).success).toBe(true);
+  });
+
+  it(
+    "reassigns the sale to a genuinely different customer — reverses the OLD customer's ledger via the sale's stored reference (even after that customer is deactivated) and debits the NEW one",
+    async () => {
+      const customerOld = (await partyService.createParty(
+        { type: "customer", name: `Reassign Old Customer ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customerOld.data.id);
+      createdOtherLedgerIds.push(customerOld.data.ledger.id);
+
+      const customerNew = (await partyService.createParty(
+        { type: "customer", name: `Reassign New Customer ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customerNew.data.id);
+      createdOtherLedgerIds.push(customerNew.data.ledger.id);
+
+      const key = await newIdempotencyKey("sale:confirm");
+      const sale = (await saleService.confirmSale(
+        {
+          customerId: customerOld.data.id,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 5, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: 0,
+          paidBank: 0,
+          creditUdhar: money(52_500), // 5*10000=50000 taxable, 5% -> 2500 tax, grand 52500
+        },
+        actor,
+        key,
+      )) as SaleResponse;
+      createdSaleIds.push(sale.data.id);
+      expect(await ledgerBalance(customerOld.data.ledger.id)).toBe(52_500n);
+      expect(await ledgerBalance(customerNew.data.ledger.id)).toBe(0n);
+
+      // The old customer is deactivated BETWEEN the original sale and this edit — the reversal
+      // must still succeed against them (it's undoing a ledger hit they already received, not
+      // validating them as eligible for a new transaction).
+      await partyService.deactivateParty(
+        customerOld.data.id,
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:deactivate"),
+      );
+
+      const editKey = await newIdempotencyKey("sale:edit");
+      const edited = (await saleService.editSale(
+        sale.data.id,
+        {
+          customerId: customerNew.data.id,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 5, freeQty: 0, discount: 0, priceIncludesGst: false }],
+        },
+        actor,
+        editKey,
+      )) as SaleResponse & { data: { customerId: string | null } };
+
+      expect(edited.data.customerId).toBe(customerNew.data.id);
+      expect(edited.data.grandTotal).toBe(52_500);
+      expect(edited.data.creditUdhar).toBe(52_500);
+
+      // OLD customer: fully reversed, despite being deactivated in between.
+      expect(await ledgerBalance(customerOld.data.ledger.id)).toBe(0n);
+      // NEW customer: correctly debited for the re-applied charge.
+      expect(await ledgerBalance(customerNew.data.ledger.id)).toBe(52_500n);
+
+      // Audit: the customer change itself is in the before/after snapshot, not just totals/lines.
+      const auditRow = await prisma.auditLog.findFirst({
+        where: { entityType: "sale", entityId: sale.data.id, action: "update" },
+        orderBy: { createdAt: "desc" },
+      });
+      expect(auditRow).not.toBeNull();
+      const before = auditRow!.before as { customerId: string | null; customerName?: string };
+      const after = auditRow!.after as { customerId: string | null; customerName?: string };
+      expect(before.customerId).toBe(customerOld.data.id);
+      expect(after.customerId).toBe(customerNew.data.id);
+      expect(before.customerName).not.toBe(after.customerName);
+    },
+    30_000,
+  );
+
+  it(
+    "reverses old postings/movements append-only (originals untouched) and re-applies new ones, each posting set summing to zero independently",
+    async () => {
+      // All-credit intra-state sale so every posting is a clean, distinguishable amount.
+      const key = await newIdempotencyKey("sale:confirm");
+      const sale = (await saleService.confirmSale(
+        {
+          customerId: customerIntraId,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: 0,
+          paidBank: 0,
+          creditUdhar: money(105_000),
+        },
+        actor,
+        key,
+      )) as SaleResponse;
+      createdSaleIds.push(sale.data.id);
+
+      const originalPostings = await prisma.ledgerPosting.findMany({ where: { voucherType: "sale", voucherId: sale.data.id } });
+      const originalMovements = await prisma.stockMovement.findMany({ where: { voucherType: "sale", voucherId: sale.data.id } });
+      expect(originalMovements).toHaveLength(1);
+      expect(originalMovements[0]?.movementType).toBe("sale_out");
+      const originalMovementSnapshot = originalMovements[0]!;
+
+      // Edit: 10@10000 (taxable100000,cgst2500,sgst2500,grand105000) -> 6@12000
+      // (taxable72000,cgst1800,sgst1800,grand75600). All-credit throughout, so creditUdhar just
+      // tracks grandTotal.
+      const editKey = await newIdempotencyKey("sale:edit");
+      const edited = (await saleService.editSale(
+        sale.data.id,
+        { lines: [{ productId: productTaxableId, unitRate: money(12_000), billedQty: 6, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKey,
+      )) as SaleResponse;
+      expect(edited.data.totalTaxable).toBe(72_000);
+      expect(edited.data.totalCgst).toBe(1_800);
+      expect(edited.data.totalSgst).toBe(1_800);
+      expect(edited.data.grandTotal).toBe(75_600);
+      expect(edited.data.creditUdhar).toBe(75_600);
+
+      // Original rows physically untouched (append-only — never mutated).
+      const originalMovementAfter = await prisma.stockMovement.findUniqueOrThrow({ where: { id: originalMovementSnapshot.id } });
+      expect(originalMovementAfter.movementType).toBe("sale_out");
+      expect(originalMovementAfter.rate).toBe(originalMovementSnapshot.rate);
+      expect(originalMovementAfter.value).toBe(originalMovementSnapshot.value);
+      expect(originalMovementAfter.quantityDelta.toNumber()).toBeCloseTo(originalMovementSnapshot.quantityDelta.toNumber(), 6);
+      for (const p of originalPostings) {
+        const stillThere = await prisma.ledgerPosting.findUniqueOrThrow({ where: { id: p.id } });
+        expect(stillThere.amount).toBe(p.amount);
+        expect(stillThere.ledgerId).toBe(p.ledgerId);
+      }
+
+      // New movement rows: exactly one reversal (sale_reversal_in, restoring the original 10 at
+      // the original out-rate) + one re-apply (sale_out, the new 6).
+      const allMovements = await prisma.stockMovement.findMany({ where: { voucherType: "sale", voucherId: sale.data.id } });
+      expect(allMovements).toHaveLength(3);
+      const reversalMovement = allMovements.find((m) => m.movementType === "sale_reversal_in")!;
+      expect(reversalMovement.quantityDelta.toNumber()).toBeCloseTo(10, 6);
+      expect(reversalMovement.rate).toBe(originalMovementSnapshot.rate); // "at the original out-rate"
+      expect(reversalMovement.referenceMovementId).toBe(originalMovementSnapshot.id);
+      const reapplyMovement = allMovements.find((m) => m.movementType === "sale_out" && m.id !== originalMovementSnapshot.id)!;
+      expect(reapplyMovement.quantityDelta.toNumber()).toBeCloseTo(-6, 6);
+      expect(reapplyMovement.rate).toBe(originalMovementSnapshot.rate); // avg_cost never moved (no purchase happened)
+
+      // New posting rows: partition into the reversal set (each exactly negates one original
+      // posting) and the remainder (the re-apply set) — assert both sum to zero INDEPENDENTLY,
+      // not just their combined total (which would be trivially zero either way).
+      const allPostingsAfter = await prisma.ledgerPosting.findMany({ where: { voucherType: "sale", voucherId: sale.data.id } });
+      const originalIds = new Set(originalPostings.map((p) => p.id));
+      const newPostings = allPostingsAfter.filter((p) => !originalIds.has(p.id));
+
+      const remainingOriginal = [...originalPostings];
+      const reversalSet: typeof newPostings = [];
+      const reapplySet: typeof newPostings = [];
+      for (const p of newPostings) {
+        const matchIndex = remainingOriginal.findIndex((o) => o.ledgerId === p.ledgerId && o.amount === -p.amount);
+        if (matchIndex >= 0) {
+          reversalSet.push(p);
+          remainingOriginal.splice(matchIndex, 1);
+        } else {
+          reapplySet.push(p);
+        }
+      }
+      expect(reversalSet).toHaveLength(originalPostings.length);
+      expect(remainingOriginal).toHaveLength(0); // every original posting was reversed exactly once
+      expect(reversalSet.reduce((s, p) => s + p.amount, 0n)).toBe(0n);
+      expect(reapplySet.reduce((s, p) => s + p.amount, 0n)).toBe(0n);
+      // Hand-verified re-apply amounts (all-credit, intra-state): Dr customer +75600, Cr Sales
+      // -72000, Cr CGST -1800, Cr SGST -1800.
+      expect(reapplySet).toHaveLength(4);
+    },
+    30_000,
+  );
+
+  it(
+    "composes reversal + re-apply with the partially-paid auto-adjust exactly, across two successive edits (Blueprint §6.11 worked example)",
+    async () => {
+      const customer = (await partyService.createParty(
+        { type: "customer", name: `Worked Example Customer ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customer.data.id);
+      createdOtherLedgerIds.push(customer.data.ledger.id);
+
+      // Original: 3 units @ ₹1000 of the EXEMPT product (0% GST, keeps every figure exactly the
+      // rupee amounts Blueprint §6.11's own worked example uses) = ₹3000. Paid ₹1000 cash, ₹2000
+      // udhar — the example's own opening numbers.
+      const key = await newIdempotencyKey("sale:confirm");
+      const sale = (await saleService.confirmSale(
+        {
+          customerId: customer.data.id,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productExemptId, unitRate: money(100_000), billedQty: 3, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: money(100_000),
+          paidBank: 0,
+          creditUdhar: money(200_000),
+        },
+        actor,
+        key,
+      )) as SaleResponse;
+      createdSaleIds.push(sale.data.id);
+      expect(sale.data.grandTotal).toBe(300_000);
+      expect(await ledgerBalance(customer.data.ledger.id)).toBe(200_000n);
+
+      // Edit 1: qty 3 -> 2.5 => new total ₹2500. paid_cash stays fixed at ₹1000; udhar 2000 -> 1500.
+      const editKey1 = await newIdempotencyKey("sale:edit");
+      const edited1 = (await saleService.editSale(
+        sale.data.id,
+        { lines: [{ productId: productExemptId, unitRate: money(100_000), billedQty: 2.5, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKey1,
+      )) as SaleResponse;
+      expect(edited1.data.grandTotal).toBe(250_000);
+      expect(edited1.data.paidCash).toBe(100_000); // frozen — real cash already collected
+      expect(edited1.data.paidBank).toBe(0);
+      expect(edited1.data.creditUdhar).toBe(150_000);
+      expect(await ledgerBalance(customer.data.ledger.id)).toBe(150_000n);
+
+      // Edit 2 — editing the ALREADY-EDITED sale, proving the reversal is multi-edit-safe (it
+      // reconstructs from the sale's current stored header, not a naive query-and-negate of every
+      // historical posting row, which would double-undo history here). qty 2.5 -> 0.8 => new total
+      // ₹800, below the ₹1000 already paid ⇒ credit_udhar = 800 - 1000 = -200: Blueprint §6.11's
+      // negative-udhar customer-advance case.
+      const editKey2 = await newIdempotencyKey("sale:edit");
+      const edited2 = (await saleService.editSale(
+        sale.data.id,
+        { lines: [{ productId: productExemptId, unitRate: money(100_000), billedQty: 0.8, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKey2,
+      )) as SaleResponse;
+      expect(edited2.data.grandTotal).toBe(80_000);
+      expect(edited2.data.paidCash).toBe(100_000); // still exactly the original real cash
+      expect(edited2.data.creditUdhar).toBe(-20_000);
+      expect(await ledgerBalance(customer.data.ledger.id)).toBe(-20_000n);
+
+      // Stock: only the FINAL applied qty (0.8) ends up net-consumed — not the sum of every
+      // intermediate edit's qty — proving each edit correctly backs out the prior state first.
+      // quantityDelta is already signed (+in/-out, §25.7), so summing this voucher's movements
+      // directly gives its net effect on branch_stock.
+      const movements = await prisma.stockMovement.findMany({ where: { voucherType: "sale", voucherId: sale.data.id } });
+      const netFromMovements = movements.reduce((sum, m) => sum + m.quantityDelta.toNumber(), 0);
+      expect(netFromMovements).toBeCloseTo(-0.8, 6);
+    },
+    30_000,
+  );
+
+  it(
+    "editing to new line values nets the same stock/ledger effect as entering those values fresh",
+    async () => {
+      const product = await prisma.product.create({
+        data: { name: `Equivalence Product ${randomUUID()}`, hsnCode: "31051000", unitId, gstRate: 5, taxClassification: "taxable" },
+      });
+      createdProductIds.push(product.id);
+      await seedStock(branchId, product.id, 1_000, 6_000);
+
+      const customerA = (await partyService.createParty(
+        { type: "customer", name: `Equivalence Customer A ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customerA.data.id);
+      createdOtherLedgerIds.push(customerA.data.ledger.id);
+
+      const customerB = (await partyService.createParty(
+        { type: "customer", name: `Equivalence Customer B ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customerB.data.id);
+      createdOtherLedgerIds.push(customerB.data.ledger.id);
+
+      // Edit path: confirm 10@10000 (grand 105000), then edit down to 6@12000 (grand 75600).
+      const keyA = await newIdempotencyKey("sale:confirm");
+      const saleA = (await saleService.confirmSale(
+        {
+          customerId: customerA.data.id,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: product.id, unitRate: money(10_000), billedQty: 10, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: 0,
+          paidBank: 0,
+          creditUdhar: money(105_000),
+        },
+        actor,
+        keyA,
+      )) as SaleResponse;
+      createdSaleIds.push(saleA.data.id);
+
+      const editKeyA = await newIdempotencyKey("sale:edit");
+      const editedA = (await saleService.editSale(
+        saleA.data.id,
+        { lines: [{ productId: product.id, unitRate: money(12_000), billedQty: 6, freeQty: 0, discount: 0, priceIncludesGst: false }] },
+        actor,
+        editKeyA,
+      )) as SaleResponse;
+      expect(editedA.data.grandTotal).toBe(75_600);
+      expect(editedA.data.creditUdhar).toBe(75_600);
+
+      const stockAfterEdit = await prisma.branchStock.findUniqueOrThrow({
+        where: { branchId_productId: { branchId, productId: product.id } },
+      });
+      const ledgerAfterEdit = await ledgerBalance(customerA.data.ledger.id);
+
+      // Direct path: confirm 6@12000 straight away on the SAME stock pool (already sitting at the
+      // edit path's post-edit quantity) with a DIFFERENT customer, so their ledger starts at 0.
+      const keyB = await newIdempotencyKey("sale:confirm");
+      const saleB = (await saleService.confirmSale(
+        {
+          customerId: customerB.data.id,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: product.id, unitRate: money(12_000), billedQty: 6, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: 0,
+          paidBank: 0,
+          creditUdhar: money(75_600),
+        },
+        actor,
+        keyB,
+      )) as SaleResponse;
+      createdSaleIds.push(saleB.data.id);
+      expect(saleB.data.grandTotal).toBe(75_600);
+
+      const stockAfterDirect = await prisma.branchStock.findUniqueOrThrow({
+        where: { branchId_productId: { branchId, productId: product.id } },
+      });
+      const ledgerAfterDirect = await ledgerBalance(customerB.data.ledger.id);
+
+      // Both paths consumed exactly 6 units of the same starting pool — the direct sale's own
+      // consumption is the second -6 stacked on top of the edit path's already-applied -6.
+      expect(stockAfterEdit.quantity.toNumber()).toBeCloseTo(1_000 - 6, 6);
+      expect(stockAfterDirect.quantity.toNumber()).toBeCloseTo(1_000 - 6 - 6, 6);
+      // Ledger equivalence: a customer whose only transaction is "6@12000 on credit" ends up with
+      // the identical receivable whether it came from a fresh entry or an edit's re-apply.
+      expect(ledgerAfterEdit).toBe(75_600n);
+      expect(ledgerAfterDirect).toBe(75_600n);
+
+      // Same avg_cost (6000, unmoved throughout — no purchase happened) drove both COGS rates.
+      const editReapplyMovement = await prisma.stockMovement.findFirst({
+        where: { voucherType: "sale", voucherId: saleA.data.id, movementType: "sale_out" },
+        orderBy: { createdAt: "desc" },
+      });
+      const directMovement = await prisma.stockMovement.findFirst({
+        where: { voucherType: "sale", voucherId: saleB.data.id, movementType: "sale_out" },
+      });
+      expect(editReapplyMovement?.rate).toBe(6_000n);
+      expect(directMovement?.rate).toBe(6_000n);
+      expect(editReapplyMovement?.value).toBe(directMovement?.value); // 6 units @ 6000 either way
+    },
+    30_000,
+  );
+
+  it(
+    "cancelSale reverses stock/ledger, retains the invoice number (never reissued), and requires a mandatory reason",
+    async () => {
+      const customer = (await partyService.createParty(
+        { type: "customer", name: `Cancel Customer ${randomUUID()}`, village: "Anand", stateCode: "24", openingBalance: 0 },
+        { userId: actor.userId, role: actor.role, branchId },
+        await newIdempotencyKey("party:create"),
+      )) as { data: { id: string; ledger: { id: string } } };
+      createdPartyIds.push(customer.data.id);
+      createdOtherLedgerIds.push(customer.data.ledger.id);
+
+      const stockBefore = await prisma.branchStock.findUniqueOrThrow({
+        where: { branchId_productId: { branchId, productId: productTaxableId } },
+      });
+
+      const key = await newIdempotencyKey("sale:confirm");
+      const sale = (await saleService.confirmSale(
+        {
+          customerId: customer.data.id,
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(10_000), billedQty: 4, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: 0,
+          paidBank: 0,
+          creditUdhar: money(42_000),
+        },
+        actor,
+        key,
+      )) as SaleResponse;
+      createdSaleIds.push(sale.data.id);
+      expect(await ledgerBalance(customer.data.ledger.id)).toBe(42_000n);
+
+      const cancelKey = await newIdempotencyKey("sale:cancel");
+      const cancelled = (await saleService.cancelSale(sale.data.id, { cancelReason: "customer changed their mind" }, actor, cancelKey)) as {
+        data: { status: string; invoiceNumber: string; cancelReason: string };
+      };
+
+      expect(cancelled.data.status).toBe("cancelled");
+      expect(cancelled.data.invoiceNumber).toBe(sale.data.invoiceNumber); // retained, not reissued
+      expect(cancelled.data.cancelReason).toBe("customer changed their mind");
+
+      // Ledger fully unwound.
+      expect(await ledgerBalance(customer.data.ledger.id)).toBe(0n);
+      // Stock fully restored to its pre-sale level.
+      const stockAfter = await prisma.branchStock.findUniqueOrThrow({
+        where: { branchId_productId: { branchId, productId: productTaxableId } },
+      });
+      expect(stockAfter.quantity.toNumber()).toBeCloseTo(stockBefore.quantity.toNumber(), 6);
+
+      // The number-series counter isn't rewound — a later confirm gets a strictly different
+      // number, so the cancelled one can never come back into circulation (the partial unique
+      // index also enforces this at the DB level; this proves the service doesn't try to work
+      // around it by, say, reusing the freed-looking number).
+      const nextKey = await newIdempotencyKey("sale:confirm");
+      const nextSale = (await saleService.confirmSale(
+        {
+          customerName: "Walk-in",
+          customerVillage: "Anand",
+          voucherDate: VOUCHER_DATE,
+          lines: [{ productId: productTaxableId, unitRate: money(1_000), billedQty: 1, freeQty: 0, discount: 0, priceIncludesGst: false }],
+          paidCash: money(1_050),
+          paidBank: 0,
+          creditUdhar: 0,
+        },
+        actor,
+        nextKey,
+      )) as SaleResponse;
+      createdSaleIds.push(nextSale.data.id);
+      expect(nextSale.data.invoiceNumber).not.toBe(sale.data.invoiceNumber);
+
+      // Audit: a real before/after status-transition snapshot (§13's edit exception), not
+      // reference-only.
+      const auditRow = await prisma.auditLog.findFirst({
+        where: { entityType: "sale", entityId: sale.data.id, action: "cancel" },
+        orderBy: { createdAt: "desc" },
+      });
+      expect(auditRow).not.toBeNull();
+      expect(auditRow?.before).not.toBeNull();
+      expect(auditRow?.after).not.toBeNull();
+      const before = auditRow!.before as { status: string };
+      const after = auditRow!.after as { status: string; cancelReason: string };
+      expect(before.status).toBe("confirmed");
+      expect(after.status).toBe("cancelled");
+      expect(after.cancelReason).toBe("customer changed their mind");
+    },
+    30_000,
+  );
 });

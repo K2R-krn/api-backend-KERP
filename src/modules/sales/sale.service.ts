@@ -10,7 +10,7 @@ import { deriveFinancialYear } from "../../shared/financial-year.js";
 import { allocateVoucherNumber, formatVoucherNumber } from "../../shared/number-series.js";
 import type { Role } from "../../shared/types.js";
 import { isDraftConfirm } from "./sale.validation.js";
-import type { ConfirmSaleInput, CreateDraftSaleInput, SaleLineInput } from "./sale.validation.js";
+import type { CancelSaleInput, ConfirmSaleInput, CreateDraftSaleInput, EditSaleInput, SaleLineInput } from "./sale.validation.js";
 
 export interface SaleActor {
   userId: string;
@@ -331,7 +331,14 @@ function requireSystemLedger(value: string | null, ledger: string): string {
   return value;
 }
 
-function resolveSystemLedgers(resolved: ResolvedSale, paidCash: bigint): SystemLedgers {
+// Narrowed to just the fields resolveSystemLedgers/buildPostings actually touch. A full
+// ResolvedSale (confirmSale/editSale's re-apply) satisfies this structurally, but editSale's
+// reversal (TDD §28.4) also needs to feed these two functions a shape built from the sale's
+// *stored* pre-edit header — which was never a live resolveSale result — so the parameter type is
+// the Pick, not ResolvedSale itself.
+type PostingSourceSale = Pick<ResolvedSale, "branch" | "companyProfile" | "customerLedgerId" | "totals">;
+
+function resolveSystemLedgers(resolved: PostingSourceSale, paidCash: bigint): SystemLedgers {
   const { totalTaxable, totalCgst, totalSgst, totalIgst, roundOff } = resolved.totals;
   return {
     cashLedgerId: paidCash > 0n ? requireSystemLedger(resolved.branch.cashLedgerId, "branch.cashLedgerId") : null,
@@ -356,7 +363,7 @@ interface PostingInput {
 }
 
 function buildPostings(
-  resolved: ResolvedSale,
+  resolved: PostingSourceSale,
   systemLedgers: SystemLedgers,
   paymentSplit: { paidCash: bigint; paidBank: bigint; bankLedgerId: string | null; creditUdhar: bigint },
 ): PostingInput[] {
@@ -745,6 +752,418 @@ export async function confirmSale(input: ConfirmSaleInput, actor: SaleActor, ide
     // lock + header/line writes + N stock movements + up to 6 ledger postings + audit +
     // idempotency), over the same remote Nepal<->Mumbai path — raised above runTransaction's
     // 20s default (CLAUDE.md: generous timeouts on DB work).
+    { timeout: 30_000 },
+  );
+}
+
+// ============================================================================
+// editSale / cancelSale — TDD §28.4 + Blueprint §6.11. Both reverse the sale's currently-effective
+// stock/ledger footprint (append-only: new compensating rows, originals never mutated) inside one
+// runTransaction, same CC-6 lock-ordering and failure/rollback discipline as confirmSale.
+//
+// Design-session-confirmed scope (see the two questions resolved before this code was written):
+//   - editSale MAY change the customer (customerId/customerName/customerVillage), with these
+//     guardrails: the OLD customer for reversal purposes comes from the sale's own stored
+//     `customerId` (never re-derived from the caller's new input), looked up WITHOUT an
+//     active/deletedAt filter (reversal targets whatever ledger the original posting actually hit,
+//     it isn't validating a party as eligible for a new transaction); the NEW customer (if any)
+//     goes through resolveSale's full live validation, identically to confirmSale; a nonzero
+//     derived credit_udhar (positive OR negative/advance) with no resulting customer is rejected,
+//     the same shape as confirmSale's CUSTOMER_REQUIRED_FOR_UDHAR check.
+//     One-line FK re-confirmation (requested during design): sale_line_items.customerId stays a
+//     real FK under this decision because it holds at the ROW level, not across the sale's
+//     lifetime — T-1 means a line row is never updated in place, only deleted-and-replaced
+//     wholesale, so a customer-changing edit simply deletes the old rows (still validly pointing
+//     at the old customer, until deleted) and inserts entirely new rows carrying the new
+//     customerId; no single row's FK value ever changes underneath it.
+//   - voucherDate is NOT editable (confirmed fixed) — invoice_number/financial_year were allocated
+//     once against it and are never reallocated on edit (§28.4), so letting the date drift would
+//     reintroduce the exact frozen-field-vs-live-related-field contradiction the §28.6 invoice
+//     payload session already caught once (there: customer GSTIN vs frozen document_type). A real
+//     date correction is cancel-and-recreate, not this flow.
+//   - There is no `edit_reason` column in the locked §25.1 schema (unlike `cancel_reason`) — edit
+//     provenance lives entirely in the audit log's before/after snapshot (T-1's stated rationale).
+// ============================================================================
+
+// TDD §20 / §28.4 T-6 (locked): a sale whose voucher_date falls on or before the branch's last
+// CLOSED day can't be edited/cancelled directly (Credit Note, or an audited Admin day-reopen,
+// instead). Iteration 4 owns the day-close feature and its schema (roadmap §29.1) — as of this
+// session there is no day-close table anywhere in the schema (checked: no such table/column exists
+// yet), so nothing has ever been closed. This function is the single call site both editSale and
+// cancelSale route through; it's written for real (not `if (false)` inlined at each call site) so
+// that when Iteration 4 adds the day-close table, only this function's body gains a real query —
+// callers and the error contract (a stable ConflictError code) never change.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- real signature for Iteration 4's future body; see comment above.
+async function assertNotPastDayClose(_tx: Tx, _branchId: string, _voucherDate: Date): Promise<void> {
+  // No day-close state exists yet — every voucher_date is therefore always "not closed." Once
+  // Iteration 4 lands a day-close table, replace this body with a real lookup and throw
+  // ConflictError("SALE_DATE_LOCKED_BY_DAY_CLOSE", { lastClosedDate }) when voucherDate <= it.
+}
+
+// Sums (billedQty + freeQty) per product from either a resolveSale line array or a sale's stored
+// line items (after mapping to this shared shape) — used for both the OLD (what reversal restores)
+// and NEW (what re-apply requires) required-quantity maps.
+function sumRequiredMilliByProduct(lines: { productId: string; billedQtyMilli: number; freeQtyMilli: number }[]): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const line of lines) {
+    const total = line.billedQtyMilli + line.freeQtyMilli;
+    map.set(line.productId, (map.get(line.productId) ?? 0) + total);
+  }
+  return map;
+}
+
+// Shared by confirmSale's step-10 shape and both editSale's reversal/re-apply posting sets: assert
+// the postings sum to zero (§18.1) and write them.
+async function writePostings(tx: Tx, actor: SaleActor, saleId: string, voucherDate: Date, postings: PostingInput[]): Promise<void> {
+  const sum = postings.reduce((acc, p) => acc + p.amount, 0n);
+  if (sum !== 0n) {
+    // Internal invariant failure — unreachable given buildPostings' algebra; not a domain AppError
+    // (rolls back the transaction as a 500), same posture as confirmSale's own check.
+    throw new Error(`ledger_postings for sale ${saleId} do not sum to zero (got ${sum.toString()})`);
+  }
+  if (postings.length > 0) {
+    await tx.ledgerPosting.createMany({
+      data: postings.map((p) => ({
+        ledgerId: p.ledgerId,
+        branchId: actor.branchId,
+        amount: p.amount,
+        voucherType: "sale",
+        voucherId: saleId,
+        voucherDate,
+        createdBy: actor.userId,
+      })),
+    });
+  }
+}
+
+type SaleWithLines = Prisma.SaleGetPayload<{ include: { lineItems: true } }>;
+
+// Reverses a sale's CURRENTLY-effective stock and ledger footprint — used identically by editSale
+// (before re-applying the revised lines) and cancelSale (which stops here). "Currently-effective"
+// matters because ledger_postings/stock_movements are append-only with no batch/generation marker:
+// after a sale has been edited more than once, simply querying-and-negating old posting rows would
+// double-undo history. Instead this RECONSTRUCTS what confirmSale's own buildPostings would have
+// produced from the sale's stored (pre-this-edit) header — via the same PostingSourceSale shape —
+// and negates that, which is correct no matter how many prior edits happened, since the stored
+// header is always the single current source of truth (CC-3). Stock reversal reads the CURRENT
+// `sale_line_items` (always up to date, T-1 replace-not-append) for quantity, and looks up each
+// product's most recent `sale_out`-type stock_movement for this voucher to get the exact rate to
+// undo — "the original out-rate" in §28.4's wording, generalized to "whichever out-rate is
+// currently in force," so avg_cost is neutrally restored regardless of edit count.
+async function reverseSaleEffects(
+  tx: Tx,
+  actor: SaleActor,
+  existing: SaleWithLines,
+  branchAndCompany: { branch: ResolvedSale["branch"]; companyProfile: ResolvedSale["companyProfile"] },
+  stockByProduct: Map<string, { quantityMilli: number; avgCost: bigint }>,
+): Promise<Map<string, number>> {
+  const oldRequiredMilliByProduct = sumRequiredMilliByProduct(
+    existing.lineItems.map((li) => ({
+      productId: li.productId,
+      billedQtyMilli: qtyToMilli(li.billedQty.toNumber()),
+      freeQtyMilli: qtyToMilli(li.freeQty.toNumber()),
+    })),
+  );
+
+  // --- Stock: restore quantity at whichever rate is currently in force, avg_cost untouched. ---
+  for (const [productId, requiredMilli] of oldRequiredMilliByProduct) {
+    if (requiredMilli === 0) continue;
+    const lastOut = await tx.stockMovement.findFirst({
+      where: { voucherType: "sale", voucherId: existing.id, productId, movementType: "sale_out" },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!lastOut) {
+      // Invariant: a confirmed sale with a nonzero required qty for this product must have written
+      // a sale_out movement at confirm (or a prior edit's re-apply). Not a domain AppError.
+      throw new Error(`invariant violated: no prior sale_out movement for sale ${existing.id} product ${productId}`);
+    }
+    const value = divRoundHalfUp(lastOut.rate * BigInt(requiredMilli), 1000n);
+    await tx.stockMovement.create({
+      data: {
+        productId,
+        branchId: actor.branchId,
+        quantityDelta: milliToDecimal(requiredMilli),
+        movementType: "sale_reversal_in",
+        rate: lastOut.rate,
+        value,
+        voucherType: "sale",
+        voucherId: existing.id,
+        voucherDate: existing.voucherDate,
+        referenceMovementId: lastOut.id,
+        avgCostAfter: stockByProduct.get(productId)!.avgCost,
+        createdBy: actor.userId,
+      },
+    });
+    await tx.branchStock.update({
+      where: { branchId_productId: { branchId: actor.branchId, productId } },
+      data: { quantity: { increment: milliToDecimal(requiredMilli) } },
+    });
+    stockByProduct.get(productId)!.quantityMilli += requiredMilli;
+  }
+
+  // --- Ledger: reconstruct the current postings from the stored header, negate, write. ---
+  let oldCustomerLedgerId: string | null = null;
+  if (existing.customerId) {
+    // No deletedAt/active filter — reversal targets whichever ledger the current posting set
+    // actually hits, not eligibility for a new transaction (design-session guardrail).
+    const oldParty = await tx.party.findFirst({ where: { id: existing.customerId } });
+    if (!oldParty) {
+      throw new Error(`invariant violated: customer ${existing.customerId} referenced by sale ${existing.id} not found`);
+    }
+    oldCustomerLedgerId = oldParty.ledgerId;
+  }
+
+  const oldState: PostingSourceSale = {
+    branch: branchAndCompany.branch,
+    companyProfile: branchAndCompany.companyProfile,
+    customerLedgerId: oldCustomerLedgerId,
+    totals: {
+      totalTaxable: existing.totalTaxable,
+      totalDiscount: existing.totalDiscount,
+      totalCgst: existing.totalCgst,
+      totalSgst: existing.totalSgst,
+      totalIgst: existing.totalIgst,
+      roundOff: existing.roundOff,
+      grandTotal: existing.grandTotal,
+    },
+  };
+  const oldSystemLedgers = resolveSystemLedgers(oldState, existing.paidCash);
+  const oldPostings = buildPostings(oldState, oldSystemLedgers, {
+    paidCash: existing.paidCash,
+    paidBank: existing.paidBank,
+    bankLedgerId: existing.bankLedgerId,
+    creditUdhar: existing.creditUdhar,
+  });
+  await writePostings(
+    tx,
+    actor,
+    existing.id,
+    existing.voucherDate,
+    oldPostings.map((p) => ({ ledgerId: p.ledgerId, amount: -p.amount })),
+  );
+
+  return oldRequiredMilliByProduct;
+}
+
+async function loadConfirmedSaleForEditOrCancel(tx: Tx, saleId: string, actor: SaleActor): Promise<SaleWithLines> {
+  const existing = await tx.sale.findFirst({ where: { id: saleId, deletedAt: null }, include: { lineItems: true } });
+  // Branch mismatch reports as not-found — same posture as loadDraftWorkingInput/getInvoicePayload.
+  if (!existing || existing.branchId !== actor.branchId) throw new NotFoundError("SALE_NOT_FOUND");
+  if (existing.status !== "confirmed") throw new ConflictError("SALE_NOT_CONFIRMED", { status: existing.status });
+  return existing;
+}
+
+export async function editSale(saleId: string, input: EditSaleInput, actor: SaleActor, idempotencyKey: string): Promise<unknown> {
+  return runTransaction(
+    async (tx) => {
+      const existing = await loadConfirmedSaleForEditOrCancel(tx, saleId, actor);
+      await assertNotPastDayClose(tx, actor.branchId, existing.voucherDate);
+
+      // Customer fields are optional on editSale's input (the design session approved letting edit
+      // change the customer), but "all three omitted" must mean "keep the sale's existing
+      // customer," not "anonymous" — resolveSale's own create-mode semantics would otherwise demand
+      // customerName/customerVillage on every line-only edit of a named sale. Any field actually
+      // supplied is treated as an explicit customer change, validated by resolveSale exactly like
+      // confirmSale (approved #1: a given customerId always uses the party's own name/village
+      // snapshot, never caller-supplied alongside it).
+      const wantsCustomerChange = input.customerId !== undefined || input.customerName !== undefined || input.customerVillage !== undefined;
+      const customerParams = wantsCustomerChange
+        ? { customerId: input.customerId, customerName: input.customerName, customerVillage: input.customerVillage }
+        : existing.customerId
+          ? { customerId: existing.customerId }
+          : { customerName: existing.customerName, customerVillage: existing.customerVillage };
+
+      // Re-resolve the NEW state (fresh party/product reads, full GST recompute) — voucherDate is
+      // pinned to the original (confirmed not editable, see the module-header note above).
+      const resolved = await resolveSale(tx, { ...customerParams, voucherDate: existing.voucherDate, lines: input.lines }, actor);
+
+      // T-5 (locked): paid_cash/paid_bank/bank_ledger_id are frozen — real money already moved and
+      // never appear in editSale's input. credit_udhar is derived and may go negative (advance).
+      const paidCash = existing.paidCash;
+      const paidBank = existing.paidBank;
+      const bankLedgerId = existing.bankLedgerId;
+      const creditUdhar = resolved.totals.grandTotal - paidCash - paidBank;
+      if (creditUdhar !== 0n && !resolved.customerId) {
+        throw new BadRequestError("CUSTOMER_REQUIRED_FOR_UDHAR");
+      }
+
+      // CC-6 — lock branch_stock for the UNION of old and new products, ascending product_id.
+      const unionProductIds = [
+        ...new Set([...existing.lineItems.map((li) => li.productId), ...resolved.lines.map((l) => l.productId)]),
+      ].sort();
+      const stockByProduct = new Map<string, { quantityMilli: number; avgCost: bigint }>();
+      for (const productId of unionProductIds) {
+        const rows = await tx.$queryRaw<{ quantity: Prisma.Decimal; avgCost: bigint }[]>`
+          SELECT quantity, avg_cost AS "avgCost" FROM branch_stock
+          WHERE branch_id = ${actor.branchId}::uuid AND product_id = ${productId}::uuid
+          FOR UPDATE`;
+        const row = rows[0];
+        stockByProduct.set(productId, {
+          quantityMilli: row ? qtyToMilli(row.quantity.toNumber()) : 0,
+          avgCost: row ? BigInt(row.avgCost) : 0n,
+        });
+      }
+
+      // §28.4 step 3 — negative-stock block against the NEW required qty, net of what the
+      // reversal below will restore (read under the lock taken above, same safety as confirmSale).
+      const oldRequiredMilliByProduct = sumRequiredMilliByProduct(
+        existing.lineItems.map((li) => ({
+          productId: li.productId,
+          billedQtyMilli: qtyToMilli(li.billedQty.toNumber()),
+          freeQtyMilli: qtyToMilli(li.freeQty.toNumber()),
+        })),
+      );
+      const newRequiredMilliByProduct = sumRequiredMilliByProduct(resolved.lines);
+      for (const productId of unionProductIds) {
+        const stock = stockByProduct.get(productId)!;
+        const restored = oldRequiredMilliByProduct.get(productId) ?? 0;
+        const required = newRequiredMilliByProduct.get(productId) ?? 0;
+        const availableAfterReversal = stock.quantityMilli + restored;
+        if (required > availableAfterReversal) {
+          throw new InsufficientStockError({ productId, available: availableAfterReversal / 1000, requested: required / 1000 });
+        }
+      }
+
+      // Reverse the currently-effective postings + stock (append-only, multi-edit-safe).
+      await reverseSaleEffects(tx, actor, existing, { branch: resolved.branch, companyProfile: resolved.companyProfile }, stockByProduct);
+
+      // Re-apply the revised lines — confirmSale steps 4-10, reused via resolveSale/buildPostings.
+      // Invoice number/financial_year are retained (§28.4) — never touched here.
+      const updatedSale = await tx.sale.update({
+        where: { id: saleId },
+        data: {
+          customerId: resolved.customerId,
+          customerName: resolved.customerName,
+          customerVillage: resolved.customerVillage,
+          placeOfSupplyStateCode: resolved.placeOfSupplyStateCode,
+          documentType: resolved.documentType,
+          totalTaxable: resolved.totals.totalTaxable,
+          totalDiscount: resolved.totals.totalDiscount,
+          totalCgst: resolved.totals.totalCgst,
+          totalSgst: resolved.totals.totalSgst,
+          totalIgst: resolved.totals.totalIgst,
+          roundOff: resolved.totals.roundOff,
+          grandTotal: resolved.totals.grandTotal,
+          paidCash,
+          paidBank,
+          creditUdhar,
+          bankLedgerId,
+          updatedBy: actor.userId,
+        },
+      });
+
+      // T-1: replace the line set (delete superseded + insert revised), history via the audit
+      // snapshot below, never soft-deleted.
+      await tx.saleLineItem.deleteMany({ where: { saleId } });
+      await tx.saleLineItem.createMany({
+        data: resolved.lines.map((line, index) => lineToRow(line, index + 1, saleId, resolved, actor)),
+      });
+
+      for (const [productId, requiredMilli] of newRequiredMilliByProduct) {
+        if (requiredMilli === 0) continue;
+        const stock = stockByProduct.get(productId)!;
+        const value = divRoundHalfUp(stock.avgCost * BigInt(requiredMilli), 1000n);
+        await tx.stockMovement.create({
+          data: {
+            productId,
+            branchId: actor.branchId,
+            quantityDelta: milliToDecimal(-requiredMilli),
+            movementType: "sale_out",
+            rate: stock.avgCost,
+            value,
+            voucherType: "sale",
+            voucherId: saleId,
+            voucherDate: existing.voucherDate,
+            avgCostAfter: stock.avgCost,
+            createdBy: actor.userId,
+          },
+        });
+        await tx.branchStock.update({
+          where: { branchId_productId: { branchId: actor.branchId, productId } },
+          data: { quantity: { decrement: milliToDecimal(requiredMilli) } },
+        });
+      }
+
+      const newSystemLedgers = resolveSystemLedgers(resolved, paidCash);
+      const newPostings = buildPostings(resolved, newSystemLedgers, { paidCash, paidBank, bankLedgerId, creditUdhar });
+      await writePostings(tx, actor, saleId, existing.voucherDate, newPostings);
+
+      const lineItems = await tx.saleLineItem.findMany({ where: { saleId }, orderBy: { lineNumber: "asc" } });
+
+      // §13's edit exception — full before/after snapshot (header + line array), not
+      // reference-only. The line array is logged wholesale either way (leanDiff can't per-line
+      // diff — T-1's rationale), so the full existing/updated rows (with their line items) are
+      // passed straight through.
+      await writeAudit(tx, actor, {
+        action: "update",
+        entityType: "sale",
+        entityId: saleId,
+        before: serializeBigInt(existing) as unknown as Record<string, unknown>,
+        after: serializeBigInt({ ...updatedSale, lineItems }) as unknown as Record<string, unknown>,
+      });
+
+      const responseBody = success(serializeBigInt({ ...updatedSale, lineItems }));
+      await completeIdempotencyKey(tx, idempotencyKey, responseBody);
+      return responseBody;
+    },
+    // Heavier than confirmSale (reversal + re-apply in one tx) — same generous remote-DB timeout.
+    { timeout: 30_000 },
+  );
+}
+
+export async function cancelSale(saleId: string, input: CancelSaleInput, actor: SaleActor, idempotencyKey: string): Promise<unknown> {
+  return runTransaction(
+    async (tx) => {
+      const existing = await loadConfirmedSaleForEditOrCancel(tx, saleId, actor);
+      await assertNotPastDayClose(tx, actor.branchId, existing.voucherDate);
+
+      const branch = await tx.branch.findFirst({ where: { id: actor.branchId, deletedAt: null } });
+      if (!branch) throw new NotFoundError("BRANCH_NOT_FOUND");
+      const companyProfile = await tx.companyProfile.findFirst({ where: { deletedAt: null } });
+      if (!companyProfile) throw new ConflictError("COMPANY_PROFILE_NOT_CONFIGURED");
+
+      // CC-6 — lock branch_stock for the sale's own products, ascending product_id.
+      const productIds = [...new Set(existing.lineItems.map((li) => li.productId))].sort();
+      const stockByProduct = new Map<string, { quantityMilli: number; avgCost: bigint }>();
+      for (const productId of productIds) {
+        const rows = await tx.$queryRaw<{ quantity: Prisma.Decimal; avgCost: bigint }[]>`
+          SELECT quantity, avg_cost AS "avgCost" FROM branch_stock
+          WHERE branch_id = ${actor.branchId}::uuid AND product_id = ${productId}::uuid
+          FOR UPDATE`;
+        const row = rows[0];
+        stockByProduct.set(productId, {
+          quantityMilli: row ? qtyToMilli(row.quantity.toNumber()) : 0,
+          avgCost: row ? BigInt(row.avgCost) : 0n,
+        });
+      }
+
+      // Same reversal as editSale's first half; cancelSale stops here — no re-apply.
+      await reverseSaleEffects(tx, actor, existing, { branch, companyProfile }, stockByProduct);
+
+      const updatedSale = await tx.sale.update({
+        where: { id: saleId },
+        data: {
+          status: "cancelled",
+          cancelReason: input.cancelReason,
+          cancelledAt: new Date(),
+          cancelledBy: actor.userId,
+          updatedBy: actor.userId,
+        },
+      });
+
+      // Same §13 edit-exception treatment as editSale — a status transition with real before/after.
+      await writeAudit(tx, actor, {
+        action: "cancel",
+        entityType: "sale",
+        entityId: saleId,
+        before: serializeBigInt(existing) as unknown as Record<string, unknown>,
+        after: serializeBigInt({ ...updatedSale, lineItems: existing.lineItems }) as unknown as Record<string, unknown>,
+      });
+
+      const responseBody = success(serializeBigInt({ ...updatedSale, lineItems: existing.lineItems }));
+      await completeIdempotencyKey(tx, idempotencyKey, responseBody);
+      return responseBody;
+    },
     { timeout: 30_000 },
   );
 }

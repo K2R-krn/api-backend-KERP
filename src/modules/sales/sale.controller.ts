@@ -5,7 +5,7 @@ import { parseWithSchema } from "../../shared/validate.js";
 import { serializeBigInt } from "../../shared/serialize.js";
 import * as saleService from "./sale.service.js";
 import type { SaleActor } from "./sale.service.js";
-import { confirmSaleSchema, createDraftSaleSchema, isDraftConfirm } from "./sale.validation.js";
+import { cancelSaleSchema, confirmSaleSchema, createDraftSaleSchema, editSaleSchema, isDraftConfirm } from "./sale.validation.js";
 
 // branchContext always runs before these controllers (see sale.routes.ts) and rejects the request
 // before reaching here if auth/branchId are missing — safe to assert, same pattern as every other
@@ -34,6 +34,30 @@ export async function confirm(req: Request, res: Response): Promise<void> {
     // draft-confirm is a transition on an existing row (200); a fresh confirm creates one (201) —
     // mirrors confirmSale's own create-vs-update branching (TDD §28.2).
     res.status(isDraftConfirm(input) ? 200 : 201).json(responseBody);
+  } catch (err) {
+    await deleteIdempotencyKey(key);
+    throw err;
+  }
+}
+
+export async function edit(req: Request, res: Response): Promise<void> {
+  const input = parseWithSchema(editSaleSchema, req.body);
+  const key = req.idempotencyKey!;
+  try {
+    const responseBody = await saleService.editSale(req.params.id as string, input, actorFrom(req), key);
+    res.status(200).json(responseBody);
+  } catch (err) {
+    await deleteIdempotencyKey(key);
+    throw err;
+  }
+}
+
+export async function cancel(req: Request, res: Response): Promise<void> {
+  const input = parseWithSchema(cancelSaleSchema, req.body);
+  const key = req.idempotencyKey!;
+  try {
+    const responseBody = await saleService.cancelSale(req.params.id as string, input, actorFrom(req), key);
+    res.status(200).json(responseBody);
   } catch (err) {
     await deleteIdempotencyKey(key);
     throw err;

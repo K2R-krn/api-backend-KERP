@@ -35,3 +35,22 @@ saleRouter.post(
   requireIdempotencyKey("sale:confirm"),
   saleController.confirm,
 );
+
+// editSale/cancelSale (TDD §28.4) — super_admin/admin only (Blueprint §6.11), enforced via
+// sale:editCancel (already in the capability map, not sale:create).
+saleRouter.patch(
+  "/:id",
+  authenticate,
+  requireCap("sale:editCancel"),
+  branchContext,
+  requireIdempotencyKey("sale:edit"),
+  saleController.edit,
+);
+saleRouter.post(
+  "/:id/cancel",
+  authenticate,
+  requireCap("sale:editCancel"),
+  branchContext,
+  requireIdempotencyKey("sale:cancel"),
+  saleController.cancel,
+);
