@@ -177,3 +177,125 @@ Full CRUD, but explicitly **not** generic CRUD (TDD §7.1/§7.3):
 **TDD Iteration 3 — Transactions** is the next major body of work: the `sales`/`purchases`/`ledger_postings`/`stock_movements` schema, the atomic Sale and Purchase services (row-locking, GST calculation, invoice numbering, ledger posting, stock movement), the bill edit/cancel workflow, hold/park-a-bill, last-price/last-cost recall, and the printable-invoice payload.
 
 Per the project's own methodology (`PROJECT_ROADMAP.md` §2), this must be **designed and locked as TDD text first**, in a dedicated design conversation — not started as a Claude Code build handoff. That design work is intentionally out of scope for this document and is being handled separately.
+
+---
+
+## 11. Iteration 3 — Transactions (Sale & Purchase services)
+
+> Continues from §10 (Phase 0/1 complete). This section covers the two atomic transaction services — the "crown jewel" of the whole project per Blueprint §6.1 — plus Stage 4's read-side secondary features. Design for all of Iteration 3 was fully locked in a separate design session before any of this was built (`TECHNICAL_DESIGN.md` §24–29, tagged `iteration3-design-locked`).
+
+### 11.1 Prerequisite infrastructure (built ahead of confirmSale)
+
+The transaction schema itself — `sales`, `sale_line_items`, `purchases`, `purchase_line_items`, `payments`, `payment_allocations`, `ledger_postings`, `stock_movements` (TDD §25.1–25.7) — was migrated and verified live first, tagged `iteration3-schema-built` (14 CHECK constraints; 2 partial unique indexes, `ux_sales_invoice_number_active` and `ux_purchases_voucher_number_active`). One naming deviation from the doc's literal text made at this step: `purchases.invoice_number` was renamed to `voucher_number`, to avoid colliding with the GST-filed sales invoice number — a purchase voucher number is an internal sequence only, never itself a GST-filed document number.
+
+Before the Sale service could be written, three further real gaps surfaced and were closed:
+
+- **System ledger resolution.** No mechanism existed for a service to find the shared ledgers it needs to post to (branch Cash, shared Sales/CGST/SGST/IGST, Round Off). Resolved with explicit nullable FK columns — `branches.cash_ledger_id` and five FKs on `company_profile` — rather than a name-based lookup, matching the existing `parties.ledger_id`/`sales.bank_ledger_id` precedent. Migrated, seeded (Round Off correctly reused from the original Phase 1 seed, not duplicated — verified by matching `id` and `createdAt`), and verified live.
+- **`number_series` first-row race condition.** `SELECT ... FOR UPDATE` only locks a row that already exists — the very first sale at a branch, or the first sale of a new financial year at any branch, hits a row that doesn't exist yet, and two concurrent confirms can both attempt to create one. This isn't a rare edge case: it recurs every 1 April at every branch. Fixed with `INSERT ... ON CONFLICT (branch_id, voucher_type, financial_year) DO NOTHING` followed by the `SELECT ... FOR UPDATE`, guaranteeing a row always exists before the lock attempt. Verified the `ON CONFLICT` arbiter matches the live `ux_number_series_active` index exactly (checked directly against `pg_index`, not assumed).
+- **`deriveFinancialYear` / `formatVoucherNumber` shared helpers.** UTC-safe FY-boundary derivation (a `DATE` column has no timezone; using local-timezone getters on a UTC-midnight `Date` can land on the wrong calendar day depending on server timezone — verified at both FY boundaries by hand). Invoice number format finalized as `{branch.code}/{financialYear}/{sequenceNumber, 4-digit padded}` — explicitly marked provisional (tracked in `PROJECT_ROADMAP.md` §9), pending confirmation of the family's actual historical numbering convention.
+
+### 11.2 confirmSale (TDD §26)
+
+Full 12-step atomic algorithm, one `runTransaction`, both entry modes (fresh create-and-confirm, and confirm-an-existing-parked-draft) converging on identical logic.
+
+**Correctly implements:** stock row-locking (`FOR UPDATE`, ascending `product_id`, sequentially awaited — never `Promise.all`, per CC-6's project-wide deadlock-avoidance invariant); the negative-stock hard-block, checked under the lock; GST computation (exclusive/inclusive back-calc, discount applied pre-GST-split, CGST/SGST floor-to-CGST/remainder-to-SGST odd-paise split, intra/inter-state determined once per bill); invoice number allocation inside the transaction (never before — a parked draft must never consume a number); `document_type` derivation per §23.1, frozen at confirm and never re-derived later; ledger postings sourced directly from the sale's own stored header totals (never independently recomputed, guaranteeing the two can never drift apart); the sum-to-zero invariant asserted before every write.
+
+**Real design decisions resolved during the build (all now locked in code + doc):**
+- Customer name/village are always snapshotted from the party record when `customerId` is given — never accepted as a caller-supplied override, closing an integrity hole where a real party could be linked to a fabricated printed name.
+- A draft confirm always re-reads the live product master (rate, GST classification, active status) — nothing about a parked bill is frozen except the bare inputs the customer originally chose. Consequence: **confirming a draft is blocked if any line's product was deactivated since it was parked** — a direct, structural consequence of "nothing is frozen," not a separate feature.
+- A wholly-giveaway sale (every line free) is rejected — would consume a real, GST-significant invoice number while producing zero ledger postings.
+- The T-8 edge case (mixed taxable+exempt lines sold to a GST-registered buyer, which the locked design doesn't auto-split into two documents) is surfaced via an explicit note in the audit log's summary, since `document_type`'s enum has no fourth value to carry it.
+
+**Bugs found and fixed:**
+1. `writeAudit`'s `action` field was unconditionally `"create"`, even when confirming an existing draft — which is a status transition on an existing row (draft → confirmed), not a create. Per §13's edit exception, this needed a real `before`/`after` snapshot. Fixed to branch on whether an existing sale ID is present.
+2. Every original golden-math test happened to produce an *even* total tax, so the CGST/SGST odd-paise split had never actually been exercised on an asymmetric case. Added a dedicated test (`lineTax = 2,501` → `cgst=1,250, sgst=1,251`), verified by hand.
+
+**Test coverage:** 18 tests against the real dev DB — exclusive/inclusive GST, free-qty exclusion from taxable value, mixed classifications, intra/inter-state split, payment-split across cash/bank/udhar, negative-stock rejection, wholly-giveaway rejection, `nearest_rupee` round-off with the correct signed posting, the odd-paise split, `SYSTEM_LEDGER_NOT_CONFIGURED`, and a genuine concurrency test (two simultaneous sales against a product with stock for exactly one — proves the row lock actually serializes rather than both reading stale stock).
+
+Tagged `iteration3-confirmsale-built`.
+
+### 11.3 confirmPurchase (TDD §27)
+
+Built as deltas from `confirmSale` — same transaction shape, same lock discipline, same posting-sourced-from-stored-totals rule, direction reversed (Dr Purchases + Dr GST-input = Cr Cash/Bank + Cr Supplier).
+
+**Real design gaps resolved before writing code** (§27 was less explicit than §26 in several places, each confirmed deliberately rather than guessed):
+- **Single entry mode only.** Unlike Sale, Purchase has no draft/park mode in this iteration — the doc's own asymmetry (§26 explicitly names both entry modes, §27 doesn't) was read as a real signal, not an oversight, and matches the actual business reality (no "customer waiting" pressure on entering a purchase). Audit is always a plain, reference-only `"create"`.
+- **Intra/inter-state comparison** — §27 never explicitly named which two fields decide this (unlike §26 step 4 for sales). Resolved as `branch.stateCode` vs. the supplier party's `stateCode`, mirroring Sale's logic with no `place_of_supply` complication (Purchase's `supplier_id` is always non-null, unlike Sale's nullable `customer_id`).
+- **Discount and embedded GST must both be netted out of the cost basis feeding `avg_cost`.** §27's literal formula (`value = billed_qty × unit_rate`) doesn't mention either — resolved as `value = taxableValue` (the already-computed, discount-net, GST-back-calculated figure), because inventory cost must reflect what was actually paid (net of trade discount) and GST paid on a purchase is recoverable ITC, never part of the goods' cost. Flagged as a doc-sync item: §27's formula text needs amending to state this explicitly.
+- **No `isActive` gate on purchase-line products** (a deliberate divergence from Sale's approved deactivation block). Justified on stronger grounds than "no draft, no staleness race": deactivation means "stop selling this," not "this product no longer exists" — blocking a purchase wouldn't stop goods from physically arriving at the shop, it would just create a gap between physical and system inventory.
+- **P-1 (locked):** a wholly-free purchase (every line `billedQty=0`) is explicitly *allowed* — the mirror image of Sale's rejection, correctly reasoned: a purchase voucher number is purely internal, not a GST-filed compliance number, so there's no "wasted invoice number" risk.
+
+**The free-unit costing precision rule (P-2) — the highest-stakes calculation in the whole iteration, verified twice, independently, by two different people/methods:**
+- The exact `value` (never the rounded, derived `rate`) must feed the weighted-average recompute formula. Worked example verified: 10 billed + 1 free @ ₹1,000/unit → `value = 1,000,000` paise exact; `rate = round(1,000,000 ÷ 11) = 90,909`; but `90,909 × 11 = 999,999 ≠ 1,000,000` — proof that multiplying the rounded rate back would silently drift the true cost by real paise.
+- A second, harder test blending a new purchase into **pre-existing** stock at a *different* prior average cost produced `avg_cost = 5,400`. This was independently disputed and then independently re-verified: a claimed discrepancy (an apparent stray unit-scaling error) was traced by both parties using two separate methods — a full dimensional-analysis proof of the bigint milli-unit arithmetic, and a clean whole-unit recompute with no milli-scaling at all (`(10×6000 + 48000)/(10+10) = 5,400`). Both converged on `5,400` as correct; the disputed figure held. The source line now carries a full derivation comment specifically so a future reader doesn't hit the same confusion cold.
+
+**Bugs found and fixed (opportunistic, outside this session's core scope but low-risk and well-justified):**
+- A flaky test timeout in `sale.service.test.ts` (unrelated file), diagnosed as genuine latency under a long full-suite run (passed cleanly in isolation, failed only under 600+ seconds of concurrent DB round-trips) — timeout budget raised with a documented reason.
+- `sale.service.test.ts`'s `afterAll` would crash with a confusing secondary `TypeError` if `beforeAll` ever failed partway through setup (masking the real root cause, and — in a worse scenario than what actually occurred — potentially leaving cleanup silently skipped). Fixed with an early-return guard.
+
+**Test coverage:** 10 tests — basic exclusive/inclusive GST (with an explicit assertion on `avg_cost` itself, not just the ledger split — the tax-exclusion rule only bites the cost-basis calculation, not the GST posting), intra/inter-state, the exact P-2 worked example, the existing-stock dilution case, wholly-free purchase (P-1), reversed-direction payment split, `PARTY_NOT_SUPPLIER`, `SYSTEM_LEDGER_NOT_CONFIGURED`.
+
+Tagged `iteration3-confirmpurchase-built`.
+
+### 11.4 Stage 4 read features (TDD §28.1, §28.5, §28.6)
+
+Lower-stakes than the two atomic services — mostly assembling data that already exists correctly, no new financial writes.
+
+**Built:**
+- **Last-price/last-cost recall** (§28.1) — given a customer/product or supplier/product pair, returns the most recent *confirmed* (not draft, not cancelled) line: the entered `unit_rate` for prefill, plus a separately-labeled `effectiveRate` (informational only, never fed back into a field). Uses the existing recall indexes with a post-seek branch filter, per the design session's already-resolved approach (T-7a) rather than promoting `branch_id` into the locked composite index. Returns `null`, not a 404, when no prior record exists (TDD's own endpoint signature settled this).
+- **Billing product search** (§28.5) — inner-joined to `branch_stock` so only genuinely stocked products for the acting branch can appear; excludes inactive/deleted products.
+- **Printable invoice payload** (§28.6) — assembles company profile branding, the confirming branch's details, current line items, the stored (never re-derived) tax split and `document_type`, payment breakdown, and a new amount-in-words helper (Indian lakh/crore numbering convention).
+- **First-ever HTTP wiring for `confirmSale`/`confirmPurchase`.** Both services were fully built, tested, and committed in isolation but had no mounted routes — genuinely unreachable by any real request until this session. Caught and corrected: the session's original scope proposed mounting only the new read endpoints, which would have left an inconsistent surface (a customer could preview a printable invoice for a sale type that couldn't actually be created via the API). All four endpoints — `POST /sales/draft`, `POST /sales/confirm`, `POST /purchases/confirm`, plus the new reads — now mounted together.
+
+**A real gap found and fixed before commit:** the printable payload's first draft live-joined the customer's *current* GSTIN from the party record. This directly undermines the whole reason `document_type` is frozen at confirm (§23.1) — if a buyer registers for GST after a sale confirms as a `bill_of_supply`, a later reprint would show a real GSTIN next to a document type that was specifically computed because they had none at the time, a visible contradiction on a legal document. Checked and confirmed no structured field captures the buyer's registration status at confirm time (`resolveSale`'s `buyerRegistered` is transient, used only to derive `document_type`); the payload now returns `gstin: null` rather than live data, with a regression test asserting this explicitly (gives a party a real GSTIN, asserts the payload doesn't leak it) so a future "obvious improvement" doesn't silently reintroduce the same contradiction. A proper fix (a frozen `customer_gstin` snapshot column, mirroring the existing `customer_name`/`customer_village` pattern) is flagged for a future schema session — deliberately out of scope for a read-only session.
+
+**Capabilities added:** `sale:read` (all four roles), `purchase:read` (super_admin/admin/accountant — Employee excluded, mirroring the existing `purchase:create` restriction; stated consequence: Employee cannot use last-cost recall).
+
+Tagged `iteration3-stage4-reads-built`.
+
+### 11.5 editSale / cancelSale (TDD §28.4)
+
+The last unbuilt piece of Iteration 3's design — deferred deliberately from earlier sessions, since it reverses real postings and stock movements and carries the same stakes as §26/§27, not the lighter Stage 4 reads.
+
+Purchase edit/cancel is explicitly **out of scope** — confirmed during the `confirmPurchase` session as a deliberate choice, not oversight. A mis-entered purchase has no in-app correction path in this iteration.
+
+**Two real scope questions resolved before writing code, both genuinely underspecified in §28.4:**
+- **Can edit change the customer?** §28.4's steps only ever mention recomputing lines/totals/udhar; Blueprint §6.11's intro names "wrong customer" as a motivating mistake but never details the mechanics. Resolved as **yes** (matching the named use case), with required guardrails: the reversal must credit back the *old* customer using the sale's prior stored reference (never re-derived from the new request), the old-customer lookup must succeed even if that party has since been deactivated, and a new customer goes through the same live validation `confirmSale` already applies.
+- **Can edit change `voucherDate`?** Resolved as **no, fixed**. Allowing it would reintroduce the exact "frozen field vs. live/changed related field" contradiction the printable-payload session had just caught and fixed for `document_type`/GSTIN — here it would be `voucherDate` moving across a financial-year boundary while `financial_year`/`invoice_number` stay anchored to the original. Also a real GST-filing-period risk (§21), not just cosmetic.
+
+**Implementation, correctly built:**
+- Reversal is **append-only and reconstructed from the sale's current stored header**, not a naive query-and-negate of historical rows — this makes it correct across repeated edits to the same sale, verified by editing one sale twice in sequence.
+- Re-apply reuses `resolveSale`'s live GST computation exactly like `confirmSale` — no duplicated math.
+- Partially-paid auto-adjust matches Blueprint §6.11's worked example exactly: `paid_cash`/`paid_bank` stay fixed at whatever was actually collected; only `credit_udhar` moves to absorb the difference. A negative result represents a genuine customer advance, requiring no special-casing (falls out of the same signed-posting mechanics `confirmSale` already has).
+- Invoice number is never reallocated on edit; cancellation retains the number permanently (enforced by the existing partial unique index at the DB level).
+- `assertNotPastDayClose` is a real, wired-in guard — honestly documented as reading nothing today (no day-close table exists yet), structured so Iteration 4 only needs to fill in its body, not rebuild the guard.
+- Full before/after audit snapshot (§13's edit exception), not reference-only, correctly capturing a customer change when one occurs.
+
+**A real bug found and fixed:** `editSale` originally forced callers to resupply `customerId` even for a pure line-item edit — omitting all three customer fields fell through to `resolveSale`'s anonymous-sale branch and incorrectly demanded name/village. Fixed by explicitly defaulting to the sale's existing customer when all three fields are omitted, distinguished from an actual change via a `wantsCustomerChange` discriminator (any of the three fields present = explicit change, routed through full live validation; all absent = keep existing).
+
+**A real gap caught in review, then closed:** the customer-reassignment path was approved as an explicit design decision but initially shipped with zero test coverage of an actual customer change — only the omission-defaults-to-existing case had been tested, which never exercises reassignment at all. Caught by asking directly "where's the test for the harder half of this," not by inspection. The resulting test is now the strongest proof in this section: confirms a sale to customer A on full credit, deactivates A via the real `partyService.deactivateParty` (not a mock), edits the sale to customer B, and asserts A's ledger returns to exactly 0, B's ledger becomes exactly the full amount, and the audit trail captures both identities — proving the old-customer reversal survives deactivation end-to-end, not just by reading a query's missing filter.
+
+**Test coverage:** 36 tests total in the sale suite (up from 18) — append-only/old-rows-untouched, both posting sets independently summing to zero, the exact Blueprint §6.11 worked example across two successive edits including the negative-udhar/advance case to the exact paisa, an edit-vs-fresh-entry economic-equivalence check, the full customer-reassignment-through-deactivation case, full cancel with retained invoice number, rejection on draft/already-cancelled sales, and role-capability enforcement (`sale:editCancel`, super_admin/admin only).
+
+Tagged `iteration3-editcancel-built`.
+
+### 11.6 Doc-sync backlog (TECHNICAL_DESIGN.md not yet updated — batch when ready)
+
+1. §27 step 6's `value` formula needs amending to state discount and embedded GST are netted out before feeding `avg_cost` (currently states the no-discount, exclusive-only special case as if it were the general rule).
+2. §28.6 needs a note that customer GSTIN must be treated the same as `document_type` — frozen at confirm, never live-joined — for the same reason, since nothing currently in the doc flags this risk explicitly.
+3. §28.4 needs to explicitly state that edit CAN change the customer (with the reversal/re-apply mechanics just built) and CANNOT change `voucherDate` — neither was addressed in the original locked text, both were real decisions made during implementation.
+4. Carried forward from earlier sessions, still outstanding: TDD §3.1's `created_by`/`updated_by` no-FK note, §25.3's `voucher_number` (not `invoice_number`) naming delta.
+5. A proper `customer_gstin` snapshot column on `sales` — currently a real, identified gap; the printable payload shows `null` rather than leaking stale-vs-live data, but the underlying feature (showing a buyer's GSTIN on a reprint at all) isn't actually implemented yet.
+
+### 11.7 Iteration 3 status: design complete, fully built
+
+Every piece of the locked Iteration 3 design — schema, `confirmSale`, `confirmPurchase`, Stage 4's read features, and `editSale`/`cancelSale` — is now built, tested against the real dev database, and committed. This is the full "crown jewel" phase per Blueprint §6.1.
+
+**Still genuinely open, carried forward, not blocking:**
+- Purchase edit/cancel — no in-app correction path exists yet, deliberate scope cut.
+- The day-close guard is real but inert until Iteration 4 populates actual close state.
+- The invoice number format and the rounding convention are both explicitly provisional, pending confirmation from the business before go-live.
+- The doc-sync backlog above needs a dedicated pass to fold back into `TECHNICAL_DESIGN.md`.
+- The parked business-conversation items in `PROJECT_ROADMAP.md` §9 (purchase:create for Employee, composition-scheme GSTIN, discount UI convention, GSTR-2B fields) remain unresolved — need an actual conversation with the family/accountant, not a technical decision.
+
+**Note for anyone picking this up cold:** real money-moving endpoints (`confirmSale`, `confirmPurchase`, `editSale`, `cancelSale`) are mounted and reachable via HTTP as of this iteration — this is no longer purely a design/test exercise. Treat anything touching these paths with the same care applied throughout this iteration's build.
