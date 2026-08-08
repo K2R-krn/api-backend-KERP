@@ -126,7 +126,7 @@ Phase 0 + Phase 1 (foundation + masters) were built from Blueprint + TDD Iterati
 7. **Build one master end-to-end as a vertical slice** — Products or Parties — full CRUD through route → controller → service → Prisma, with validation, auth, branch scoping, and audit. **This proves the whole architecture works.**
 8. Then build the remaining masters (branches, users, units, categories, the other of products/parties) + opening-balance/stock import.
 
-Phase 0 + Phase 1 (foundation + masters) are now fully built. Iteration 3 (Transactions) is designed and locked — see `TECHNICAL_DESIGN.md` §24–29. The next action is **building it**: schema first (TDD §25), then the atomic Sale/Purchase services (TDD §26–27), then the secondary features (TDD §28).
+Phase 0 + Phase 1 (foundation + masters) are now fully built. Iteration 3 (Transactions) is now **fully built** — schema, `confirmSale`, `confirmPurchase`, Stage 4's read features, and `editSale`/`cancelSale`, all tested against the real dev DB and committed (see `BUILD_LOG.md` §11). The next action is **designing Iteration 4** (Payments, Ledgers, Outstanding, Cash Reconciliation) per §5, following the same design-then-build methodology as Iteration 3.
 
 ---
 
@@ -241,7 +241,7 @@ There are **7 iterations total**; 1–2 are done. The count is a guide, not sacr
 2. **Opening prompt suggestion:**
    > "I'm building the fertilizer-shop management system described in these three docs. Blueprint and TDD Iterations 1–3 are locked. I want to **build Iteration 3's code, starting with the schema.** Follow the methodology in the roadmap §2 (design-then-build, review-then-lock, now-vs-later discipline) and keep the docs in lockstep."
 3. **To build first:** ask for help scaffolding the repo, writing `schema.prisma` from TDD §5–6, and the auth + one-master vertical slice (roadmap §4).
-4. **To build Iteration 3:** Iteration 3's design is locked (TDD §24–29) — the next step is building it, starting with `schema.prisma` per TDD §25 (the transaction tables), then the atomic Sale/Purchase services (TDD §26–27).
+4. **To design Iteration 4:** Iteration 3 is fully built (schema, `confirmSale`, `confirmPurchase`, Stage 4 reads, `editSale`/`cancelSale` — see `BUILD_LOG.md` §11) — the next step is writing Iteration 4's TDD design per roadmap §5's scope (payments/receipts, ledger balances & statements, outstanding + ageing, cash reconciliation), reviewed and locked, **before any code is written** — the same design-then-build process Iteration 3 went through.
 5. **Keep the loop:** design an iteration → review → lock → build the phase → next iteration.
 
 ---
