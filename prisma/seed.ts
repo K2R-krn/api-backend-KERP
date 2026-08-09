@@ -221,6 +221,31 @@ async function seedCompanyProfileSystemLedgers(
   console.log("company_profile: linked sales/purchases/CGST/SGST/IGST/round-off ledgers");
 }
 
+// Links company_profile's cash/bank account-GROUP FKs (TDD §31.1 / CC-7 applied one level up —
+// confirmPayment validates a caller-supplied cash_bank_ledger_id against these stored ids, never
+// a live name lookup). Same skip-if-already-set posture as seedCompanyProfileSystemLedgers.
+async function seedCompanyProfileAccountGroupRefs(tx: Prisma.TransactionClient, accountGroupIdByName: Map<string, string>) {
+  const profile = await tx.companyProfile.findUnique({ where: { id: COMPANY_PROFILE_ID } });
+  if (!profile) {
+    console.log("company_profile: missing — skipping cash/bank account-group links");
+    return;
+  }
+
+  const cashAccountGroupId = profile.cashAccountGroupId ?? accountGroupIdByName.get("Cash-in-Hand");
+  const bankAccountGroupId = profile.bankAccountGroupId ?? accountGroupIdByName.get("Bank Accounts");
+
+  if (profile.cashAccountGroupId && profile.bankAccountGroupId) {
+    console.log("company_profile: cash/bank account-group links already set");
+    return;
+  }
+
+  await tx.companyProfile.update({
+    where: { id: COMPANY_PROFILE_ID },
+    data: { cashAccountGroupId, bankAccountGroupId },
+  });
+  console.log("company_profile: linked Cash-in-Hand/Bank Accounts account groups");
+}
+
 // Backfill for branches created before branches.cash_ledger_id existed (branch.service.ts now
 // creates this ledger inline for every new branch — this only covers pre-existing rows).
 async function seedBranchCashLedgers(tx: Prisma.TransactionClient, accountGroupIdByName: Map<string, string>) {
@@ -256,6 +281,7 @@ async function main() {
       await seedSuperAdmin(tx);
       const ledgerIdByName = await seedLedgers(tx, accountGroupIdByName);
       await seedCompanyProfileSystemLedgers(tx, ledgerIdByName);
+      await seedCompanyProfileAccountGroupRefs(tx, accountGroupIdByName);
       await seedBranchCashLedgers(tx, accountGroupIdByName);
     },
     // Overrides the shared default (10s/5s) — round trips grew with the system-ledger backfill

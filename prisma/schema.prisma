@@ -144,6 +144,13 @@ model CompanyProfile {
   sgstLedgerId      String? @map("sgst_ledger_id") @db.Uuid
   igstLedgerId      String? @map("igst_ledger_id") @db.Uuid
   roundOffLedgerId  String? @map("round_off_ledger_id") @db.Uuid
+  // CC-7 applied one level up: confirmPayment (TDD §31.1) validates a caller-supplied
+  // cash_bank_ledger_id belongs to specifically the Cash-in-Hand or Bank Accounts seeded groups
+  // (§6.1), never nature='asset' generally. Resolved ONCE by seed.ts (by name, the same one-time
+  // offline resolution every other system-ledger FK here already uses) and stored — the service
+  // itself only ever compares against these stored ids, never does a live name lookup.
+  cashAccountGroupId String? @map("cash_account_group_id") @db.Uuid
+  bankAccountGroupId String? @map("bank_account_group_id") @db.Uuid
 
   createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz()
   updatedAt DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
@@ -157,6 +164,8 @@ model CompanyProfile {
   sgstLedger      Ledger? @relation("CompanyProfileSgstLedger", fields: [sgstLedgerId], references: [id])
   igstLedger      Ledger? @relation("CompanyProfileIgstLedger", fields: [igstLedgerId], references: [id])
   roundOffLedger  Ledger? @relation("CompanyProfileRoundOffLedger", fields: [roundOffLedgerId], references: [id])
+  cashAccountGroup AccountGroup? @relation("CompanyProfileCashAccountGroup", fields: [cashAccountGroupId], references: [id])
+  bankAccountGroup AccountGroup? @relation("CompanyProfileBankAccountGroup", fields: [bankAccountGroupId], references: [id])
 
   @@index([salesLedgerId])
   @@index([purchasesLedgerId])
@@ -164,6 +173,8 @@ model CompanyProfile {
   @@index([sgstLedgerId])
   @@index([igstLedgerId])
   @@index([roundOffLedgerId])
+  @@index([cashAccountGroupId])
+  @@index([bankAccountGroupId])
   @@map("company_profile")
 }
 
@@ -188,6 +199,9 @@ model AccountGroup {
   parentGroup AccountGroup?  @relation("AccountGroupHierarchy", fields: [parentGroupId], references: [id])
   childGroups AccountGroup[] @relation("AccountGroupHierarchy")
   ledgers     Ledger[]
+
+  companyProfilesAsCashGroup CompanyProfile[] @relation("CompanyProfileCashAccountGroup")
+  companyProfilesAsBankGroup CompanyProfile[] @relation("CompanyProfileBankAccountGroup")
 
   @@index([parentGroupId])
   @@map("account_groups")

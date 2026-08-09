@@ -7,6 +7,7 @@ import { authRouter } from "./modules/auth/auth.routes.js";
 import { branchRouter } from "./modules/branches/branch.routes.js";
 import { categoryRouter } from "./modules/categories/category.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
+import { paymentRouter } from "./modules/payments/payment.routes.js";
 import { productRouter } from "./modules/products/product.routes.js";
 import { purchaseRouter } from "./modules/purchases/purchase.routes.js";
 import { saleRouter } from "./modules/sales/sale.routes.js";
@@ -65,5 +66,11 @@ app.use("/api/v1/users", userRouter);
 // payload) get their first HTTP wiring here.
 app.use("/api/v1/sales", saleRouter);
 app.use("/api/v1/purchases", purchaseRouter);
+
+// Iteration 4 (TDD §30-32) — confirmPayment (standalone Receipt/Payment vouchers) + Fast Expense
+// Entry, its thin wrapper (§31.5). remainingBalance (§32) has no HTTP endpoint of its own yet —
+// it's a pure helper confirmPayment calls internally; a read-only "outstanding invoices" view is
+// future work (§34), not this session's scope.
+app.use("/api/v1/payments", paymentRouter);
 
 app.use(errorHandler);
