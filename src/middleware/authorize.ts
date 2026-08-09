@@ -40,6 +40,10 @@ export type Capability =
   | "stock:adjust"
   | "cashCount:enter" // Employee "enters cash count" only (TDD §7.2) — distinct from resolving the close.
   | "cashClose:resolve"
+  // Ledger statement (§33) / outstanding-ageing (§34) reports. Deliberately excludes Employee, same
+  // posture as purchase:read: TDD §7.2 frames Accountant as "read-only, reports only" and Employee
+  // as day-to-day operations only (billing/receipts/expenses/cash count) — reports aren't in
+  // Employee's list. super_admin/admin/accountant only, stated explicitly rather than left implied.
   | "report:view"
   | "auditLog:view"; // Blueprint: Admin "own branch" — branch scoping enforced by branchContext, not here.
 
@@ -68,7 +72,7 @@ const CAN: Record<Capability, Role[]> = {
   "stock:adjust": ["super_admin", "admin"],
   "cashCount:enter": ["super_admin", "admin", "employee"],
   "cashClose:resolve": ["super_admin", "admin"],
-  "report:view": ["super_admin", "admin", "employee", "accountant"],
+  "report:view": ["super_admin", "admin", "accountant"],
   "auditLog:view": ["super_admin", "admin"],
 };
 

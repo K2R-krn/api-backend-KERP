@@ -1772,6 +1772,17 @@ per day; `id` breaks any remaining tie deterministically, so the same query alwa
 same running balance. Display sign flips by ledger nature at the presentation layer only (§18.1);
 storage and computation here are always debit-positive.
 
+> ⚠️ **Implementation note, general — not specific to this query.** Any Postgres aggregate over a
+> `bigint` column — `SUM()`, a `SUM() OVER (...)` window function, or arithmetic against one like
+> §34's `credit_udhar - COALESCE(SUM(...), 0)` — returns `numeric`, not `bigint`; Postgres widens
+> to avoid overflow regardless of the source column's type. Prisma's `$queryRaw` therefore
+> deserializes the result as `Prisma.Decimal`, not a native JS `bigint`, even though every operand
+> was bigint-typed. Verified against the real dev DB, not assumed
+> (`SELECT SUM(x) OVER (...) FROM (SELECT 100::bigint) x` came back as a Decimal object, while a
+> directly-selected bigint column deserializes correctly). Convert explicitly
+> (`BigInt(decimal.toFixed(0))`) before treating the result as money — this will resurface the
+> moment a future report does the same kind of raw-SQL aggregation over a bigint column.
+
 **No CC-8 filter needed here** — see §30. `ledger_postings` is append-only and already
 self-correcting for cancellations via the reversal rows `cancelSale` writes.
 
@@ -1798,6 +1809,10 @@ ORDER BY s.voucher_date ASC
 
 Mirrored for `purchases`/payables. Roll up per party for the summary line, with drill-down to
 individual invoice rows (Blueprint §7).
+
+`credit_udhar - COALESCE(SUM(pa.amount), 0)` is bigint arithmetic against a `SUM()` aggregate —
+same numeric-vs-`Decimal` deserialization gotcha as §33's running balance; see the implementation
+note there. Convert before treating `remaining_balance` as money.
 
 **Ageing buckets:** `0–30 / 31–60 / 61+` days from `voucher_date`, non-overlapping cutoffs.
 

@@ -6,10 +6,12 @@ import { branchContext } from "./middleware/branch-context.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
 import { branchRouter } from "./modules/branches/branch.routes.js";
 import { categoryRouter } from "./modules/categories/category.routes.js";
+import { ledgerRouter } from "./modules/ledgers/ledger.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
 import { paymentRouter } from "./modules/payments/payment.routes.js";
 import { productRouter } from "./modules/products/product.routes.js";
 import { purchaseRouter } from "./modules/purchases/purchase.routes.js";
+import { reportRouter } from "./modules/reports/report.routes.js";
 import { saleRouter } from "./modules/sales/sale.routes.js";
 import { unitRouter } from "./modules/units/unit.routes.js";
 import { userRouter } from "./modules/users/user.routes.js";
@@ -69,8 +71,14 @@ app.use("/api/v1/purchases", purchaseRouter);
 
 // Iteration 4 (TDD §30-32) — confirmPayment (standalone Receipt/Payment vouchers) + Fast Expense
 // Entry, its thin wrapper (§31.5). remainingBalance (§32) has no HTTP endpoint of its own yet —
-// it's a pure helper confirmPayment calls internally; a read-only "outstanding invoices" view is
-// future work (§34), not this session's scope.
+// it's a pure helper confirmPayment calls internally.
 app.use("/api/v1/payments", paymentRouter);
+
+// Iteration 4 continued — ledger statement view (§33) and outstanding/ageing report (§34). Both
+// skip branchContext deliberately: their branch scoping is an object-level property of the target
+// (a ledger, a bill), not an acting branch declared up front — see assertBranchAccess
+// (shared/branch-access.ts) and each service's own comments.
+app.use("/api/v1/ledgers", ledgerRouter);
+app.use("/api/v1/reports", reportRouter);
 
 app.use(errorHandler);
