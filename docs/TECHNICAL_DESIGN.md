@@ -17,7 +17,7 @@ This doc grows in the same order you'll build. Each iteration is reviewed and lo
 | **2** | Backend architecture: layered pattern, custom auth, auth/permission/branch middleware, audit logging, idempotency, validation, error handling | ✅ locked |
 | **DC** | **Data-contract addendum (§18–22):** ledger posting sign convention + posting map, weighted-average costing + cost on stock movements, edit-vs-day-close rule, voucher_date/day boundaries, testing strategy | ✅ locked — binds Iterations 3+ |
 | 3 | Transactions: sales/purchases schema + line items, ledger_postings, stock_movements, the atomic Sale/Purchase services, bill edit/cancel, hold/park, last-price recall, printable-invoice payload | ✅ locked |
-| 4 | Payments, ledgers, outstanding, cash reconciliation | planned |
+| 4 | Payments, ledgers, outstanding, cash reconciliation | ✅ locked |
 | 5 | Returns, adjustments, contra, journal | planned |
 | 6 | Reports & GST exports | planned |
 | 7 | Multi-branch consolidation, deployment, Docker, backups | planned |
@@ -1527,3 +1527,530 @@ Permission: `sale:editCancel` — super_admin / admin only (already in the capab
 4. **Iteration-5 `reason` CHECK** on `stock_movements` (§25.7) — add the non-null-for-adjustments constraint when Stock Adjustment (Iteration 5) is designed.
 
 Open questions needing an actual conversation with the business (not a technical decision) are tracked in `PROJECT_ROADMAP.md` §9, not duplicated here.
+
+---
+
+# Iteration 4 — Payments, Ledgers, Outstanding, Cash Reconciliation
+
+---
+
+## 30. Cross-Cutting Decision CC-8 — Cancelled Vouchers Are Historical, Never Live Outstanding
+
+A cancelled sale/purchase retains its historical stored totals (`credit_udhar` included) for audit
+purposes only — `cancelSale` never touches them. **No consumer may treat those figures as live
+receivable/payable.** Every consumer of `credit_udhar`-as-outstanding — `confirmPayment`'s
+allocation validation, the ageing report, anything built later — must filter
+`status = 'confirmed'` before reading `credit_udhar` as real debt.
+
+**This filter is not needed everywhere `credit_udhar` intuitively feels relevant.** The ledger
+statement view (§33) reads `ledger_postings`, not sale/purchase headers — and `ledger_postings` is
+already append-only, with `cancelSale`'s reversal writing offsetting rows that net a cancelled
+sale to zero automatically. CC-8 exists specifically because the **header field** `credit_udhar`
+is deliberately left stale on cancellation (§28.4), a different data shape with a different
+safety mechanism. Two distinct guarantees for two distinct representations of the same underlying
+fact — don't add CC-8's filter where the append-only design already makes it redundant, and don't
+skip it where a header field is being read directly.
+
+---
+
+## 31. Atomic Payment Service (`confirmPayment`)
+
+Applies to both standalone Receipt and Payment vouchers (`voucher_type = 'receipt' | 'payment'`),
+posted against the `payments`/`payment_allocations` schema locked in §25.5. Runs in one
+`runTransaction`, same idempotency/atomicity contract as `confirmSale`/`confirmPurchase`.
+
+### 31.1 `cash_bank_ledger_id` resolution
+
+The frontend resolves and passes `cash_bank_ledger_id` directly — it fetches the branch's
+`cash_ledger_id` (via the branch's own CC-7 FK) plus the branch's configured bank ledgers, and
+sends a resolved id straight into `confirmPayment`. No symbolic `{ type: 'cash' }` flag for the
+service to resolve — that would open a second, name/type-based resolution path alongside CC-7 for
+no reason. This keeps "never a name-based lookup" honest at the API boundary, not just inside the
+service.
+
+**Server-side validation (locked, corrected from an earlier looser draft):** the ledger must
+exist, must belong to this branch (or be a null-branch shared ledger — shouldn't apply here in
+practice), and its `account_group_id` must map to **specifically the Cash-in-Hand or Bank
+Accounts seeded groups** (§6.1) — not merely `nature = 'asset'` generally. `nature = 'asset'` also
+matches Fixed Assets and the Customers/Receivables group; a loose asset-nature check would
+silently accept a payment posted against a customer's own receivable ledger as if it were a cash
+account. The check resolves the ledger's `account_group_id` and compares it against the two
+specific seeded group ids, not the coarser `nature` enum.
+
+### 31.2 `voucher_number`
+
+Adding `'receipt'`/`'payment'` to `number_series.voucher_type` is a new row per
+`(branch, voucher_type, financial_year)` — no collision with `sale`/`purchase` by construction.
+
+> ⚠️ **Unconfirmed against the live schema.** If `number_series.voucher_type` (or any related
+> column) carries an enum-style `CHECK` constraint restricting allowed values, widening it is a
+> migration, not a design decision. Verify against the real dev DB before this ships.
+
+### 31.3 Ledger posting shape
+
+Two lines per payment, sign per §18.1 (Dr+, Cr−):
+
+| Voucher type | Dr (+) | Cr (−) |
+|---|---|---|
+| `receipt` | `cash_bank_ledger_id` | `party_id`'s ledger, or `counter_ledger_id` if unlinked |
+| `payment` | `party_id`'s ledger, or `counter_ledger_id` if unlinked | `cash_bank_ledger_id` |
+
+`branch_id` = the payment's branch, `voucher_type` = `receipt`/`payment`, `voucher_id` = payment
+id, `voucher_date` = payment date. Direct application of the already-locked §18 contract — nothing
+new to decide.
+
+### 31.4 Idempotency & audit
+
+Same shape as `confirmSale`/`confirmPurchase`: `Idempotency-Key` on the endpoint,
+`writeAudit` snapshot inside the same transaction. No open questions.
+
+### 31.5 Fast Expense Entry
+
+Not a separate service — a thin wrapper over `confirmPayment`. The schema already supports it
+exactly (`counter_ledger_id` = expense ledger, `party_id` = null). Simplified input (amount,
+expense ledger, optional note); `cash_bank_ledger_id` defaults to the branch's cash ledger via the
+CC-7 FK (no picker); `direction` fixed to `payment`. One posting/idempotency/audit code path
+underneath, not two to keep in sync.
+
+> ⚠️ **Open business question, not resolved here.** Do expense categories map 1:1 to ledgers
+> already (e.g. "Electricity," "Staff Tea" each as their own ledger under Direct/Indirect
+> Expenses), or is a lighter category tag — separate from the chart of accounts — wanted? If 1:1,
+> Fast Expense Entry's picker is just a filtered ledger dropdown and there's nothing else to
+> design. If not, that's new modeling scoped separately. Needs an actual answer from Karan before
+> Fast Expense Entry's picker UI is built; track alongside the other `PROJECT_ROADMAP.md` §9
+> parked business items (invoice-number prefix, discount UI convention, GSTR-2B fields,
+> composition-scheme GSTIN).
+
+### 31.6 Payment allocation — input shape and direction pairing
+
+```
+allocations?: Array<{ sale_id?: uuid, purchase_id?: uuid, amount: bigint }>
+```
+
+Exactly-one-of `sale_id`/`purchase_id` per entry, matching the `payment_allocations` table's own
+CHECK. `sum(allocations.amount) ≤ payment.amount`; the remainder is implicitly on-account/advance
+— no flag needed, matching the schema note that unallocated remainder isn't a stored column.
+
+**Direction pairing — locked as a service-level check, not left open:** `receipt` may only
+allocate against `sale_id`s; `payment` may only allocate against `purchase_id`s. The unconstrained
+pairing would otherwise allow a wrong-direction posting to slip through — money out applied
+against a sale, or money in applied against a purchase — easy to post backwards by mistake at a
+counter. The gap this closes off is refunds (a customer refund is money *out* against a *sale*; a
+supplier refund is money *in* against a *purchase*) — but refunds have no real use case yet: the
+refund-generating feature (Credit Note / returns) is Iteration 5 scope, and `editSale`'s existing
+advance case (§28.4, T-5) is already fully handled by direct ledger math with no allocation
+involved. Cross-pairing is explicitly deferred to Iteration 5's design, not left unconstrained in
+the meantime.
+
+### 31.7 Allocation validation — full check ordering
+
+For each allocation entry, in order:
+
+1. **Target row doesn't exist** → `NotFoundError` (`ALLOCATION_TARGET_NOT_FOUND`) — detected as a
+   side effect of the lock query itself (§32.3): diff the requested id set against the ids
+   actually returned by the batched `FOR UPDATE`, since a missing row simply returns fewer rows.
+2. **Status guard** → reject if target `status ≠ 'confirmed'` (CC-8).
+3. **Branch guard** → reject if target `branch_id ≠ payment.branch_id`.
+4. **`remainingBalance ≤ 0`** → reject, nothing owed (§32.2).
+5. **`allocation.amount > remainingBalance`** → reject, over-allocation.
+6. **Proceed** — insert the allocation row.
+
+---
+
+## 32. `remainingBalance` Helper
+
+The figure `confirmPayment`'s allocation validation needs: how much of a specific invoice's
+credit portion is still unpaid.
+
+### 32.1 Formula
+
+- `remainingBalance(saleId)` = `sale.credit_udhar − Σ(payment_allocations.amount WHERE sale_id = saleId)`
+- `remainingBalance(purchaseId)` = `purchase.credit_udhar − Σ(payment_allocations.amount WHERE purchase_id = purchaseId)`
+
+Both pull from the header's stored `credit_udhar` — never independently recomputed from line
+items — consistent with CC-3. Bill-wise, not ledger-wide: this answers "how much is still owed on
+*this invoice*," a different question from the party's overall ledger balance (§33).
+
+### 32.2 Guards
+
+- **Status guard (CC-8):** only `status = 'confirmed'` targets are valid. A cancelled sale's
+  `credit_udhar` is stale by design (§28.4 never updates it on cancellation) — without this guard,
+  `remainingBalance` on a cancelled sale would return its pre-cancellation figure and silently
+  allow a payment to allocate against a void bill.
+- **Branch guard:** target's `branch_id` must equal the payment's `branch_id`. Party ledgers are
+  branch-scoped (§6.2); a receipt in Branch A crediting Branch A's copy of a party ledger has no
+  coherent relationship to an invoice recorded in Branch B. A hard boundary check, the same
+  posture CC-7 takes toward name-based ledger lookups.
+- **Zero/negative handling:** `remainingBalance` must be `> 0` to be a valid allocation target. A
+  sale sitting on a negative `credit_udhar` (a customer advance from billing time, §28.4 T-5) has
+  nothing outstanding to collect against — allocating there is a modeling error, not a valid
+  partial payment. Checked before the over-allocation comparison (§31.7 steps 4–5), so the
+  rejection reads as "nothing owed" rather than a confusing negative-headroom failure.
+
+### 32.3 Locking discipline
+
+Extends CC-6, not a new pattern. `confirmPayment` may reference multiple sales/purchases in one
+payment — lock every referenced row before computing, using the same `$queryRaw ... FOR UPDATE`
+shape already used for `branch_stock` (Prisma's ordinary client has no `FOR UPDATE` support).
+**Fixed global order:** lock `sales` rows first (ascending `id`), then `purchases` rows (ascending
+`id`) — an arbitrary but fixed choice, followed by every call, so two concurrent multi-target
+payments can't deadlock against each other.
+
+Compute the `Σ(payment_allocations.amount)` fresh **after** the lock is acquired, inside the same
+transaction. Since `confirmPayment` is the sole writer of `payment_allocations`, a second
+concurrent payment targeting the same invoice blocks on the row lock until the first commits, then
+correctly sees the first payment's allocation in its own sum.
+
+**Interaction with a concurrent `editSale`/`cancelSale` on the same row — verified safe, no
+special-casing needed on their side.** Postgres's implicit row lock on an `UPDATE` is the same
+lock class `SELECT ... FOR UPDATE` takes:
+
+```
+// Lock discipline note (parallel to assertNotPastDayClose's forward-dependency comment):
+// This SELECT ... FOR UPDATE is the only defense against a concurrent editSale/cancelSale
+// racing this function's remainingBalance computation on the same sale/purchase row. No
+// special-casing needed in editSale/cancelSale themselves — Postgres's ordinary implicit
+// row lock on UPDATE (the same lock class SELECT ... FOR UPDATE takes) already serializes
+// against them:
+//   - If this transaction locks the row first, editSale/cancelSale's own UPDATE blocks on
+//     that row until this transaction commits or rolls back, then proceeds against the
+//     post-commit row. Their writes never need to re-read credit_udhar/status themselves
+//     (editSale recomputes credit_udhar from values already read earlier in its own tx;
+//     cancelSale just sets status), so blocking mid-transaction costs nothing correctness-wise.
+//   - If editSale/cancelSale's UPDATE runs first, it holds the row lock until its own commit;
+//     this SELECT ... FOR UPDATE then blocks until that commit, and reads the POST-edit/
+//     post-cancel row — exactly the fresh state remainingBalance needs.
+// No deadlock risk: editSale/cancelSale each touch at most one row in this lock's table
+// (plus branch_stock, a disjoint table this function never locks), so they can never hold
+// one row this function needs while waiting on a second row this function also holds — the
+// two-resource cycle a deadlock requires can't form on this pairing.
+```
+
+### 32.4 Function shape
+
+One plain formula function, no lock-taking inside it: `remainingBalance(tx, { saleId } | { purchaseId })`
+runs the guarded sum and returns a `bigint`. Locking is the caller's responsibility, taken
+explicitly at the top of `confirmPayment` before any `remainingBalance` calls — the same
+separation CC-6 already uses (stock lock lives at the call site, not buried in a shared helper).
+This also makes the function directly reusable later for a read-only "outstanding invoices" view
+with no lock semantics dragged into a read path.
+
+### 32.5 Known, expected non-bug: negative `remainingBalance` after an edit
+
+An `editSale` that shrinks a bill below what's already been collected against it (via a later
+receipt) produces a negative `remainingBalance` for that invoice. This is not an error state — the
+ageing report's `> 0` filter (§34) excludes it cleanly, and it correctly reads as a
+settled-with-credit invoice. No special handling needed; noted here so it isn't rediscovered as a
+bug later.
+
+---
+
+## 33. Ledger Statement View
+
+Per-ledger chronological statement with a running balance (Blueprint §7). Read-only report, no
+lock needed.
+
+**Base balance for a ranged query:** `ledger.opening_balance + SUM(postings WHERE voucher_date < from)`
+— computed once, only when a `from` date is supplied. With no range, the base is
+`ledger.opening_balance` directly (§6.2, §18.1).
+
+**Running balance — one SQL pass with a window function:**
+
+```sql
+SELECT lp.*,
+       :baseBalance + SUM(lp.amount) OVER (
+         ORDER BY lp.voucher_date, lp.created_at, lp.id
+       ) AS running_balance
+FROM ledger_postings lp
+WHERE lp.ledger_id = :ledgerId
+  [AND lp.voucher_date BETWEEN :from AND :to]
+ORDER BY lp.voucher_date, lp.created_at, lp.id
+```
+
+`voucher_date, created_at, id` as the sort key, in that order — `voucher_date` alone isn't unique
+per day; `id` breaks any remaining tie deterministically, so the same query always reproduces the
+same running balance. Display sign flips by ledger nature at the presentation layer only (§18.1);
+storage and computation here are always debit-positive.
+
+**No CC-8 filter needed here** — see §30. `ledger_postings` is append-only and already
+self-correcting for cancellations via the reversal rows `cancelSale` writes.
+
+---
+
+## 34. Outstanding / Ageing Report
+
+Bill-wise, not ledger-wise — built from `sales`/`purchases` headers joined against
+`payment_allocations`, because bill-level granularity only exists there; the ledger balance alone
+can't say which specific invoice is how old.
+
+```sql
+SELECT s.id, s.customer_id, s.branch_id, s.voucher_date, s.invoice_number,
+       s.credit_udhar - COALESCE(SUM(pa.amount), 0) AS remaining_balance
+FROM sales s
+LEFT JOIN payment_allocations pa ON pa.sale_id = s.id
+WHERE s.status = 'confirmed'          -- CC-8
+  AND s.credit_udhar > 0              -- pure-cash sales never need to appear
+  [AND s.branch_id = :branchId]       -- per-branch mode; omitted = consolidated
+GROUP BY s.id
+HAVING s.credit_udhar - COALESCE(SUM(pa.amount), 0) > 0
+ORDER BY s.voucher_date ASC
+```
+
+Mirrored for `purchases`/payables. Roll up per party for the summary line, with drill-down to
+individual invoice rows (Blueprint §7).
+
+**Ageing buckets:** `0–30 / 31–60 / 61+` days from `voucher_date`, non-overlapping cutoffs.
+
+> ⚠️ **Business-convention flag, same category as the invoice-prefix and discount-UI-convention
+> items already parked in `PROJECT_ROADMAP.md` §9.** These edges are a reasonable engineering
+> default, not a confirmed accounting convention. If the accountant has an existing way of
+> thinking about "how overdue," it may not match these exact cutoffs. Not required to resolve
+> before building the report; don't treat it as fully settled without a chance to check.
+
+**Two non-bugs worth stating here, not rediscovering later:**
+
+- **The ageing total will not equal the party's ledger balance, by design.** The ageing report is
+  per-bill outstanding for collection follow-up; the ledger balance is the true net, inclusive of
+  on-account amounts and advances not tied to any specific invoice. Don't wire a "these should
+  match" assertion between them.
+- **A negative `remainingBalance` from an edit (§32.5) is absorbed silently by the `> 0` filter**
+  — it just stops appearing on the list, correctly, as settled-with-credit.
+
+---
+
+## 35. Day-End Cash Reconciliation
+
+Blueprint §10.11 / roadmap Iteration 4. The one piece of this iteration that is **retroactively
+binding on already-shipped Iteration 3 code** (§35.4).
+
+### 35.1 Schema — `day_closes`
+
+One row per `(branch_id, close_date)`. Status-machine on a single mutable row, not append-only —
+closer in kind to `sales.status` than to `ledger_postings`: it isn't itself summed into anything,
+so there's no CC-2-style corruption risk in mutating it, and reopen/reclose history lives in the
+audit snapshot on each transition, same treatment as `editSale`.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | uuid | PK | |
+| `branch_id` | uuid | FK → branches.id, not null | |
+| `close_date` | date | not null | Business date this close covers (§21 semantics). |
+| `status` | text | not null, check in (`closed`,`reopened`) | |
+| `opening_cash` | bigint | not null | Paise. §35.3. |
+| `expected_closing_cash` | bigint | not null | Paise. Computed at close time (§35.2), frozen. |
+| `actual_counted_cash` | bigint | not null | Paise. Operator-entered. |
+| `short_over` | bigint | not null | Paise. `actual_counted_cash − expected_closing_cash`; positive = over, negative = short. |
+| `note` | text | nullable | Optional short/over note. |
+| `reopen_reason` | text | nullable | Required when `status = 'reopened'`, null otherwise. |
+| `closed_at` | timestamptz | not null | |
+| `closed_by` | uuid | nullable | |
+| `reopened_at` | timestamptz | nullable | |
+| `reopened_by` | uuid | nullable | |
+
++ common columns (`created_at`/`updated_at`). No `deleted_at` — this row is never deleted, only
+status-transitioned. Unique on `(branch_id, close_date)` — plain unique index, no partial
+condition needed.
+
+### 35.2 Expected-cash computation
+
+```
+expected_closing_cash = opening_cash + SUM(
+  ledger_postings.amount
+  WHERE ledger_id = branch.cashLedgerId
+    AND branch_id = branchId
+    AND voucher_date = closeDate
+)
+```
+
+One signed sum, not four separately-queried categories added and subtracted by hand. This is the
+same append-only self-correction argument as the statement view (§33, §30) — a same-day cancelled
+cash sale nets to zero automatically via its reversal posting. Re-deriving "cash sales," "cash
+receipts," etc. from `sales`/`payments` header fields directly would reintroduce the exact
+staleness risk CC-8 exists to prevent, into a brand-new feature. The category breakdown for the
+printable summary comes from grouping the same query on `voucher_type` — display only, the total
+doesn't depend on it.
+
+**Forward-compatible with Iteration 5 for free:** a contra (cash→bank deposit) voucher, once it
+exists, is just another posting hitting this same cash ledger — automatically included in this
+formula with zero changes to day-close code.
+
+### 35.3 Opening-cash sourcing
+
+`opening_cash` for a given close = the **previous closed day's `actual_counted_cash`**, not its
+`expected_closing_cash`. If yesterday was short ₹200, that ₹200 is genuinely missing from the
+drawer — today's reconciliation starts from what's physically there, not from the theoretical
+figure. Sourcing from `expected` instead would let the day-close silently absorb yesterday's gap
+every day, defeating its purpose as a cumulative-drift check.
+
+For a branch's very first close ever (no prior `day_closes` row), there is no prior actual to pull
+from — `opening_cash` is a one-time manually-entered starting float, supplied explicitly on that
+first call only.
+
+### 35.4 Guard extension to voucher creation — retroactive change
+
+**Answering the question carried forward from Iteration 3's `assertNotPastDayClose`:** the day-close
+guard must also block a *new* sale, purchase, or payment being dated onto an already-closed day —
+not just edits/cancels of existing transactions. Nothing in Iteration 3 stops `confirmSale` or
+`confirmPurchase` from writing a `voucher_date` on/before the branch's last closed day, which
+invalidates the frozen expected-cash figure the same way an unguarded edit would.
+
+**Locked: block, not flag — blanket scope, matching §20's existing edit/cancel scope exactly.**
+Any new sale, purchase, or payment dated onto a closed day is blocked regardless of cash
+involvement, consistent with how edit/cancel already applies unconditionally. Direct mutation is
+blocked; Admin/Super Admin reopen (§35.6) is the sanctioned escape hatch — the same two-path shape
+§20 already established for edits, extended to creates rather than inventing a third
+"flagged-but-allowed" state.
+
+> ⚠️ **Retroactive to shipped code.** `confirmSale` and `confirmPurchase` are live. Both — plus the
+> new `confirmPayment` — must call `assertNotPastDayClose` near the top, mirroring
+> `editSale`/`cancelSale`'s existing call. Costs nothing today (the guard is still a no-op until
+> `day_closes` rows exist) but must land as part of this iteration's work, or the day day-close
+> ships, `confirmSale`/`confirmPurchase` are silently unprotected while `editSale`/`cancelSale`
+> are — the exact doc/implementation drift this project's standing review discipline exists to
+> catch.
+
+### 35.5 Concurrency — advisory lock mechanism
+
+A plain row-check can't solve the race between closing a day and confirming a new voucher for that
+same day: before the first close, no `day_closes` row exists yet to `FOR UPDATE` lock — the same
+class of problem `number_series`'s first-row race solved with `INSERT ... ON CONFLICT DO NOTHING`,
+requiring a different fix here since there's no row we want to pre-create as a placeholder.
+
+**`pg_advisory_xact_lock`, keyed on `(branch_id, voucher_date)`**, taken by every operation that
+touches anything day-close-sensitive for that date: `confirmSale`, `confirmPurchase`,
+`confirmPayment`, `editSale`, `cancelSale`, `closeDay`, `reopenDay`, `recloseDay`. Transaction-scoped
+(auto-released on commit/rollback), requires no existing row.
+
+**Key derivation and namespace:**
+
+```
+pg_advisory_xact_lock(DAY_CLOSE_LOCK_NAMESPACE, hashtext(`${branchId}|${voucherDateISO}`))
+```
+
+- `DAY_CLOSE_LOCK_NAMESPACE` — a fixed `int4` constant, private to this lock's purpose, isolating
+  it from any other feature that may reach for advisory locks in the future.
+- `voucherDateISO` — the already-IST-resolved `date` (§21), rendered as plain `YYYY-MM-DD`.
+  `branchId` the raw UUID string. `|` separator, appears in neither component.
+- `hashtext()` — Postgres builtin `text → int4`, deterministic, feeds the two-key overload's
+  second slot.
+
+**Collision case — named explicitly, bounded to a latency cost, not a correctness risk.**
+`hashtext()`'s output space is 32 bits; realistic cardinality (a handful of branches × thousands
+of calendar days) puts collision probability at a small fraction of a percent over the system's
+lifetime. More importantly: `hashtext()` is deterministic, so the *same* `(branch_id, voucher_date)`
+always maps to the same key — real contention is never at risk. A collision only means two
+*unrelated* branch/date pairs occasionally share a lock key, causing an unnecessary wait
+(milliseconds, for these transaction sizes) before proceeding normally. Advisory locks are pure
+mutual exclusion — a collision can only add unwanted exclusion, never remove exclusion where it
+was needed, so this can never manifest as a correctness bug.
+
+**One code path, not one shared formula feeding independent call sites.** The helper owns the
+actual lock call, not just the key derivation:
+
+```typescript
+// Sole entry point for the day-close advisory lock. No other code may call
+// pg_advisory_xact_lock for this purpose, and the namespace constant is not
+// exported — there is no raw key for a future call site to reimplement
+// against, only this function.
+async function acquireDayLock(tx: Tx, branchId: string, voucherDate: Date): Promise<void> {
+  const key = `${branchId}|${formatISODate(voucherDate)}`;
+  await tx.$queryRaw`SELECT pg_advisory_xact_lock(${DAY_CLOSE_LOCK_NAMESPACE}, hashtext(${key}))`;
+}
+```
+
+`assertNotPastDayClose`'s real implementation (replacing the Iteration-3 no-op stub) calls
+`acquireDayLock(tx, branchId, voucherDate)` first, then queries `day_closes` for
+`MAX(close_date) WHERE branch_id = X AND status = 'closed'` and rejects if `voucherDate` falls
+on/before it. Every caller — old and new — still only ever calls `assertNotPastDayClose`; zero
+shape change at those call sites. `closeDay`/`reopenDay`/`recloseDay` call `acquireDayLock`
+directly, since they're not checking a voucher, they *are* the day-close operation — but resolve
+through the same single function, so the key-derivation formula cannot drift between the two use
+sites.
+
+`pg_advisory_xact_lock`'s lifetime is tied to the enclosing Postgres transaction; `tx.$queryRaw`
+runs on that same transaction/connection inside `runTransaction`, so acquire/release is correct
+with no special handling needed from `runTransaction` itself.
+
+**Throughput note, not a blocker:** this serializes mutations for a given `(branch, date)` only
+during the narrow window a close/reopen/reclose is actually running — negligible given closes are
+rare, brief, once-a-day events, and serializing sales around the exact moment of a close is the
+correct behavior, not a cost to avoid.
+
+### 35.6 Close / reopen / reclose ordering
+
+**`closeDay(branchId, closeDate, actualCash, note, idempotencyKey)`:**
+
+1. `acquireDayLock(tx, branchId, closeDate)`.
+2. Load existing `day_closes` row for this key, if any:
+   - `status = 'closed'` already → reject (`DAY_ALREADY_CLOSED`; must reopen first).
+   - `status = 'reopened'` → this is a reclose.
+   - No row → first close for this date.
+3. Resolve `opening_cash` (§35.3).
+4. Compute `expected_closing_cash` (§35.2).
+5. `short_over = actualCash − expected_closing_cash`.
+6. Upsert the row, `status → 'closed'`.
+7. Audit + idempotency, same shape as every other transactional service.
+
+**`reopenDay(branchId, closeDate, reason, actor)`** — Admin/Super Admin only (Blueprint §10.11):
+
+1. `acquireDayLock(tx, branchId, closeDate)`.
+2. Load row; must exist and be `status = 'closed'` (else Not Found/Conflict).
+3. GST-filed-period check (§35.7).
+4. `status → 'reopened'`, `reopen_reason` mandatory, `reopened_at`/`reopened_by`.
+5. Audit before/after.
+
+Reclose runs `closeDay` again against the same key, recomputing `expected_closing_cash` and
+`short_over` fresh — both the original close and the reclose are preserved via the audit
+before/after snapshot on each transition, the same pattern `editSale`/`cancelSale` already use.
+
+### 35.7 New forward dependency — GST-filed-period check (mirrors T-6)
+
+§20 point 4 requires blocking reopen inside a period whose GSTR has been filed. That state doesn't
+exist yet — GSTR export/filing tracking is Iteration 6 scope. Same sequencing shape as
+`assertNotPastDayClose` was for Iteration 3: ship the check now, reading state that doesn't
+populate until Iteration 6 lands it, vacuously permissive in the meantime, activates automatically
+once that state exists. Tracked deliberately here, the same way T-6 was tracked, rather than left
+as an implicit gap to rediscover later.
+
+### 35.8 Permissions
+
+Blueprint §10.11: "the operator enters the count" but "only Admin/Super Admin resolve
+discrepancies." Read: Employee-level roles can perform the close itself (enter count; the system
+computes and stores `short_over` automatically as part of that action). Reopen is Admin/Super
+Admin only (§20 point 3, and independently stated in Blueprint §10.11) — "resolving a
+discrepancy" beyond simply recording it is understood to mean the reopen path, not a separate
+resolution mechanism the spec doesn't otherwise describe.
+
+---
+
+## 36. What Iteration 4 Locks, and What's Next
+
+**Locked this iteration:** CC-8 (cancelled-voucher historical-only rule, extending CC-1…CC-7); the
+atomic `confirmPayment` service — `cash_bank_ledger_id` resolution and its Cash-in-Hand/Bank
+Accounts-specific validation, the two-line posting shape, Fast Expense Entry as a thin wrapper,
+payment allocation input shape and locked direction pairing (receipt→sale, payment→purchase); the
+`remainingBalance` helper and its full guard/lock/check-ordering discipline; the ledger statement
+view (window-function running balance); the bill-wise outstanding/ageing report; and day-end cash
+reconciliation in full — the `day_closes` schema, the `ledger_postings`-sourced expected-cash
+formula, the opening-cash-from-actual sourcing rule, the retroactive extension of the day-close
+guard to voucher creation, and the `pg_advisory_xact_lock` concurrency mechanism.
+
+**Schema added this iteration:** `day_closes` (§35.1). `payments`/`payment_allocations` get their
+first writer (`confirmPayment`) against the schema already locked in §25.5.
+
+**Retroactive changes to already-shipped Iteration 3 code:** `confirmSale` and `confirmPurchase`
+must add a call to `assertNotPastDayClose` (§35.4); `assertNotPastDayClose` itself moves from a
+no-op stub to a real implementation that also acquires the advisory lock (§35.5).
+
+### 36.1 Carried into Iteration 5 / Iteration 6 (not resolved this iteration)
+
+1. **Refund cross-pairing** (receipt→purchase, payment→sale) — deferred to Iteration 5's Credit
+   Note / returns design, which is what actually generates refunds (§31.6).
+2. **GST-filed-period state** for the reopen guard (§35.7) — populated in Iteration 6.
+3. **`number_series.voucher_type` CHECK constraint** — unconfirmed against the live schema
+   (§31.2); verify before `confirmPayment` ships, migrate if needed.
+4. **Expense category modeling** (§31.5) — open business question, needs an answer from Karan
+   before Fast Expense Entry's picker UI is built.
+5. **Ageing bucket edges** (§34) — provisional engineering default; worth a check against the
+   accountant's actual convention before treated as final. Add to the `PROJECT_ROADMAP.md` §9
+   parked list alongside the existing business-conversation items.
