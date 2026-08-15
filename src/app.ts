@@ -6,6 +6,7 @@ import { branchContext } from "./middleware/branch-context.js";
 import { authRouter } from "./modules/auth/auth.routes.js";
 import { branchRouter } from "./modules/branches/branch.routes.js";
 import { categoryRouter } from "./modules/categories/category.routes.js";
+import { dayCloseRouter } from "./modules/day-close/day-close.routes.js";
 import { ledgerRouter } from "./modules/ledgers/ledger.routes.js";
 import { partyRouter } from "./modules/parties/party.routes.js";
 import { paymentRouter } from "./modules/payments/payment.routes.js";
@@ -80,5 +81,9 @@ app.use("/api/v1/payments", paymentRouter);
 // (shared/branch-access.ts) and each service's own comments.
 app.use("/api/v1/ledgers", ledgerRouter);
 app.use("/api/v1/reports", reportRouter);
+
+// Iteration 4 continued — day-end cash reconciliation (§35): closeDay/reopenDay. Separate
+// capabilities per role (cashCount:enter vs. cashClose:resolve), enforced per route.
+app.use("/api/v1/day-close", dayCloseRouter);
 
 app.use(errorHandler);

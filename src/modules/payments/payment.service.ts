@@ -1,4 +1,5 @@
 import { prisma, runTransaction } from "../../db/client.js";
+import { assertNotPastDayClose } from "../day-close/day-close.service.js";
 import { writeAudit, type Tx } from "../../shared/audit.js";
 import { completeIdempotencyKey } from "../../shared/idempotency.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../../shared/errors.js";
@@ -164,6 +165,12 @@ async function validateAndBuildAllocation(
 export async function confirmPayment(input: ConfirmPaymentInput, actor: PaymentActor, idempotencyKey: string): Promise<unknown> {
   return runTransaction(
     async (tx) => {
+      // §35.4/§35.6 — retroactive guard extension: a NEW receipt/payment dated onto a closed day
+      // is blocked, blanket scope (a pure-udhar-touching allocation still retroactively changes
+      // that day's books). input.voucherDate is available unconditionally, so this is literally
+      // the first statement in the transaction.
+      await assertNotPastDayClose(tx, actor.branchId, input.voucherDate);
+
       const branch = await tx.branch.findFirst({ where: { id: actor.branchId, deletedAt: null } });
       if (!branch) throw new NotFoundError("BRANCH_NOT_FOUND");
       const companyProfile = await tx.companyProfile.findFirst({ where: { deletedAt: null } });

@@ -70,6 +70,7 @@ model Branch {
   payments          Payment[]
   ledgerPostings    LedgerPosting[]
   stockMovements    StockMovement[]
+  dayCloses         DayClose[]
 
   @@index([code])
   @@index([cashLedgerId])
@@ -659,6 +660,35 @@ model LedgerPosting {
   @@index([branchId, voucherDate])
   @@index([voucherType, voucherId])
   @@map("ledger_postings")
+}
+
+// TDD §35.1 — a status machine on one row (closer to sales.status than to ledger_postings), never
+// deleted, only status-transitioned. No deleted_at; no created_by/updated_by — closed_by/
+// reopened_by already attribute each transition, so those columns would be redundant.
+model DayClose {
+  id                  String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  branchId            String    @map("branch_id") @db.Uuid
+  closeDate           DateTime  @map("close_date") @db.Date
+  status              String    @default("closed")
+  openingCash         BigInt    @map("opening_cash")
+  expectedClosingCash BigInt    @map("expected_closing_cash")
+  actualCountedCash   BigInt    @map("actual_counted_cash")
+  shortOver           BigInt    @map("short_over")
+  note                String?
+  reopenReason        String?   @map("reopen_reason")
+  closedAt            DateTime  @map("closed_at") @db.Timestamptz()
+  closedBy            String?   @map("closed_by") @db.Uuid
+  reopenedAt          DateTime? @map("reopened_at") @db.Timestamptz()
+  reopenedBy          String?   @map("reopened_by") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz()
+
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  @@unique([branchId, closeDate])
+  @@index([branchId, status, closeDate])
+  @@map("day_closes")
 }
 
 model StockMovement {

@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma, runTransaction } from "../../db/client.js";
+import { assertNotPastDayClose } from "../day-close/day-close.service.js";
 import { writeAudit, type Tx } from "../../shared/audit.js";
 import { completeIdempotencyKey } from "../../shared/idempotency.js";
 import { BadRequestError, ConflictError, NotFoundError } from "../../shared/errors.js";
@@ -395,6 +396,12 @@ async function assertBankLedgerExists(tx: Tx, ledgerId: string): Promise<void> {
 export async function confirmPurchase(input: ConfirmPurchaseInput, actor: PurchaseActor, idempotencyKey: string): Promise<unknown> {
   return runTransaction(
     async (tx) => {
+      // §35.4 — retroactive guard extension: a NEW purchase dated onto a closed day is blocked,
+      // same as edit/cancel, blanket scope regardless of cash involvement. input.voucherDate is
+      // available unconditionally here (no draft mode for purchases), so this is literally the
+      // first statement in the transaction.
+      await assertNotPastDayClose(tx, actor.branchId, input.voucherDate);
+
       const paidCash = BigInt(input.paidCash);
       const paidBank = BigInt(input.paidBank);
       const creditToSupplier = BigInt(input.creditToSupplier);

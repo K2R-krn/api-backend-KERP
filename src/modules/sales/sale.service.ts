@@ -1,5 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { prisma, runTransaction } from "../../db/client.js";
+import { assertNotPastDayClose } from "../day-close/day-close.service.js";
 import { writeAudit, type Tx } from "../../shared/audit.js";
 import { completeIdempotencyKey } from "../../shared/idempotency.js";
 import { BadRequestError, ConflictError, InsufficientStockError, NotFoundError } from "../../shared/errors.js";
@@ -572,6 +573,12 @@ export async function confirmSale(input: ConfirmSaleInput, actor: SaleActor, ide
         };
       }
 
+      // §35.4 — retroactive guard extension: a NEW sale dated onto a closed day is blocked, same
+      // as edit/cancel, blanket scope regardless of cash involvement. voucherDate is only known
+      // unconditionally past this point (draft mode resolves it from the draft row above), so this
+      // is the earliest correct placement — still before any lock/validation/write below.
+      await assertNotPastDayClose(tx, actor.branchId, saleParams.voucherDate);
+
       const paidCash = BigInt(input.paidCash);
       const paidBank = BigInt(input.paidBank);
       const creditUdhar = BigInt(input.creditUdhar);
@@ -785,20 +792,11 @@ export async function confirmSale(input: ConfirmSaleInput, actor: SaleActor, ide
 //     provenance lives entirely in the audit log's before/after snapshot (T-1's stated rationale).
 // ============================================================================
 
-// TDD §20 / §28.4 T-6 (locked): a sale whose voucher_date falls on or before the branch's last
-// CLOSED day can't be edited/cancelled directly (Credit Note, or an audited Admin day-reopen,
-// instead). Iteration 4 owns the day-close feature and its schema (roadmap §29.1) — as of this
-// session there is no day-close table anywhere in the schema (checked: no such table/column exists
-// yet), so nothing has ever been closed. This function is the single call site both editSale and
-// cancelSale route through; it's written for real (not `if (false)` inlined at each call site) so
-// that when Iteration 4 adds the day-close table, only this function's body gains a real query —
-// callers and the error contract (a stable ConflictError code) never change.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars -- real signature for Iteration 4's future body; see comment above.
-async function assertNotPastDayClose(_tx: Tx, _branchId: string, _voucherDate: Date): Promise<void> {
-  // No day-close state exists yet — every voucher_date is therefore always "not closed." Once
-  // Iteration 4 lands a day-close table, replace this body with a real lookup and throw
-  // ConflictError("SALE_DATE_LOCKED_BY_DAY_CLOSE", { lastClosedDate }) when voucherDate <= it.
-}
+// TDD §20 / §28.4 T-6: a sale whose voucher_date falls on or before the branch's last CLOSED day
+// can't be edited/cancelled directly (Credit Note, or an audited Admin day-reopen, instead).
+// assertNotPastDayClose (imported above) is the single call site editSale and cancelSale route
+// through, now with a real body — Iteration 4 (§35) landed the day_closes table and the advisory
+// lock this function also acquires. See day-close.service.ts for the implementation.
 
 // Sums (billedQty + freeQty) per product from either a resolveSale line array or a sale's stored
 // line items (after mapping to this shared shape) — used for both the OLD (what reversal restores)
