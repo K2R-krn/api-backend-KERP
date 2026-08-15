@@ -126,7 +126,7 @@ Phase 0 + Phase 1 (foundation + masters) were built from Blueprint + TDD Iterati
 7. **Build one master end-to-end as a vertical slice** — Products or Parties — full CRUD through route → controller → service → Prisma, with validation, auth, branch scoping, and audit. **This proves the whole architecture works.**
 8. Then build the remaining masters (branches, users, units, categories, the other of products/parties) + opening-balance/stock import.
 
-Phase 0 + Phase 1 (foundation + masters) are now fully built. Iteration 3 (Transactions) is now **fully built** — schema, `confirmSale`, `confirmPurchase`, Stage 4's read features, and `editSale`/`cancelSale`, all tested against the real dev DB and committed (see `BUILD_LOG.md` §11). Iteration 4 (Payments, Ledgers, Outstanding, Cash Reconciliation) is designed and locked — see `TECHNICAL_DESIGN.md` §30–36. The next action is **building it**: schema first (`day_closes`, TDD §35.1), then `confirmPayment` (TDD §31), then the statement/ageing views (TDD §33–34), then day-close (TDD §35.6).
+Phase 0 + Phase 1 (foundation + masters) are now fully built. Iteration 3 (Transactions) is now **fully built** — schema, `confirmSale`, `confirmPurchase`, Stage 4's read features, and `editSale`/`cancelSale`, all tested against the real dev DB and committed (see `BUILD_LOG.md` §11). Iteration 4 (Payments, Ledgers, Outstanding, Cash Reconciliation) is now **fully built** — `confirmPayment`, `remainingBalance`, the ledger statement view, the outstanding/ageing report, and day-end cash reconciliation, all tested against the real dev DB and committed (see `BUILD_LOG.md` §12, tagged `iteration4-complete`). The next action is **designing Iteration 5** (Returns, Adjustments, Contra, Journal) per roadmap §5, following the same design-then-build methodology as Iterations 3 and 4.
 
 ---
 
@@ -241,7 +241,7 @@ There are **7 iterations total**; 1–2 are done. The count is a guide, not sacr
 2. **Opening prompt suggestion:**
    > "I'm building the fertilizer-shop management system described in these three docs. Blueprint and TDD are locked through the current iteration (check `TECHNICAL_DESIGN.md` §0 for exactly which). I want to continue per the roadmap's design-then-build methodology (§2: design-then-build, review-then-lock, now-vs-later discipline) and keep the docs in lockstep."
 3. **To build first:** ask for help scaffolding the repo, writing `schema.prisma` from TDD §5–6, and the auth + one-master vertical slice (roadmap §4).
-4. **To build Iteration 4:** Iteration 4's design is locked (TDD §30–36) — the next step is building it, starting with the `day_closes` schema (TDD §35.1), then `confirmPayment` (TDD §31), then the statement/ageing views (TDD §33–34), then day-close (TDD §35.6).
+4. **To design Iteration 5:** Iteration 4 is fully built — the next step is writing Iteration 5's TDD design per roadmap §5's scope, reviewed and locked, before any code is written.
 5. **Keep the loop:** design an iteration → review → lock → build the phase → next iteration.
 
 ---
